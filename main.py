@@ -253,7 +253,7 @@ SAMPLE_LEAVE_SUBMISSION = {
 async def submit_leave(
     body: SubmitLeaveRequest = Body(
         ...,
-        example=SAMPLE_LEAVE_SUBMISSION,
+        examples=SAMPLE_LEAVE_SUBMISSION,
         description="Leave submission payload. Use the sample schema as reference.",
     ),
 ) -> LeaveSubmissionResponse:
