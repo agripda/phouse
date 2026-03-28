@@ -22,6 +22,10 @@ import streamlit as st
 from dotenv import load_dotenv
 import os
 
+# ── st.dialog availability check (requires Streamlit ≥ 1.36) ─────────────────
+_ST_VERSION = tuple(int(x) for x in st.__version__.split(".")[:2])
+HAS_DIALOG  = _ST_VERSION >= (1, 36)
+
 # ── Config ────────────────────────────────────────────────────────────────────
 load_dotenv()
 
@@ -68,6 +72,95 @@ def working_days(start: date, end: date) -> int:
             count += 1
         cur += timedelta(days=1)
     return count
+
+
+def _dq_issue_rows(dq_issues: list) -> None:
+    """Render DQ issues grouped by domain — shared by dialog and expander."""
+    domain_groups: dict = {}
+    for issue in dq_issues:
+        domain_groups.setdefault(issue["domain"], []).append(issue)
+
+    domain_colors = {
+        "Accuracy":     ("#e6f1fb", "#185fa5"),
+        "Completeness": ("#eaf3de", "#3b6d11"),
+        "Consistency":  ("#faeeda", "#854f0b"),
+        "Timeliness":   ("#eeedfe", "#534ab7"),
+        "Uniqueness":   ("#faece7", "#993c1d"),
+    }
+
+    for domain, issues in domain_groups.items():
+        bg, fg = domain_colors.get(domain, ("#f1efe8", "#5f5e5a"))
+        st.markdown(
+            f"<span style='background:{bg};color:{fg};"
+            f"padding:2px 10px;border-radius:4px;"
+            f"font-size:12px;font-weight:600'>{domain}</span>",
+            unsafe_allow_html=True,
+        )
+        for issue in issues:
+            st.markdown(
+                f"<div style='border-left:3px solid {fg};"
+                f"background:#fafafa;padding:8px 12px;"
+                f"margin:4px 0 8px;border-radius:0 4px 4px 0'>"
+                f"<span style='background:#faeeda;color:#854f0b;"
+                f"padding:1px 6px;border-radius:3px;"
+                f"font-size:11px;font-weight:700;margin-right:8px'>"
+                f"{issue['code']}</span>"
+                f"<span style='font-size:13px;color:#333'>{issue['message']}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+
+def show_dq_result(submission_id: str, dq_issues: list, total_days: int) -> None:
+    """
+    Show submission result with DQ warnings.
+    Uses st.dialog on Streamlit ≥ 1.36, falls back to st.toast + st.expander.
+    """
+    if not dq_issues:
+        st.success(f"✅ Submission created — **{submission_id}**  ({total_days} days)")
+        return
+
+    if HAS_DIALOG:
+        # ── Native modal dialog ───────────────────────────────────────────────
+        @st.dialog("⚠️ Submission accepted with DQ warnings")
+        def _dialog():
+            st.markdown(
+                f"**Submission ID:** `{submission_id}`  &nbsp;·&nbsp; "
+                f"**{total_days}** working days recorded",
+            )
+            st.caption(
+                "The submission was saved successfully. The following Data Quality "
+                "warnings have been recorded for governance review."
+            )
+            st.divider()
+            _dq_issue_rows(dq_issues)
+            st.divider()
+            if st.button("OK — close", use_container_width=True, type="primary"):
+                st.rerun()
+
+        _dialog()
+
+    else:
+        # ── Fallback: toast + warning banner + expander ───────────────────────
+        st.toast(
+            f"⚠️ {len(dq_issues)} DQ warning(s) on {submission_id}",
+            icon="⚠️",
+        )
+        st.warning(
+            f"⚠️ Submission created with **{len(dq_issues)} DQ warning(s)** "
+            f"— **{submission_id}**"
+        )
+        with st.expander(
+            f"⚠️ {len(dq_issues)} Data Quality warning(s) — click to review",
+            expanded=True,
+        ):
+            st.caption(
+                "Submission was accepted. These are soft warnings "
+                "recorded for governance review."
+            )
+            _dq_issue_rows(dq_issues)
+
+
 
 
 def next_submission_id() -> str:
@@ -216,8 +309,20 @@ if page == "📝 Submit Leave":
                     resp = requests.post(f"{API_BASE}/leave-submissions", json=payload, timeout=10)
                     if resp.status_code == 201:
                         data = resp.json()
-                        st.success(f"✅ Submission created — **{data['submissionId']}**")
-                        st.json(data)
+                        dq_issues = data.get("dq_issues", [])
+
+                        # Show result — modal dialog or fallback based on Streamlit version
+                        show_dq_result(
+                            submission_id=data["submissionId"],
+                            dq_issues=dq_issues,
+                            total_days=data.get("totalWorkingDaysCreated", 0),
+                        )
+
+                        # Submission detail (always available, collapsed)
+                        if not dq_issues:
+                            with st.expander("📋 Submission details", expanded=False):
+                                st.json(data)
+
                     elif resp.status_code == 409:
                         # Rare race condition — retry once with refreshed ID
                         retry_id = next_submission_id()
@@ -226,11 +331,19 @@ if page == "📝 Submit Leave":
                         if resp2.status_code == 201:
                             data = resp2.json()
                             st.success(f"✅ Submission created (retry) — **{data['submissionId']}**")
-                            st.json(data)
+                            with st.expander("📋 Submission details", expanded=False):
+                                st.json(data)
                         else:
                             st.error(f"❌ Retry failed HTTP {resp2.status_code}: {resp2.text}")
                     elif resp.status_code == 400:
-                        st.error(f"❌ Validation: {resp.json().get('detail', resp.text)}")
+                        detail = resp.json().get("detail", resp.text)
+                        st.error("❌ Validation failed")
+                        st.markdown(
+                            f"<div style='background:#fcebeb;border-left:4px solid #a32d2d;"
+                            f"padding:10px 14px;border-radius:4px;font-size:13px;color:#a32d2d'>"
+                            f"{detail}</div>",
+                            unsafe_allow_html=True,
+                        )
                     else:
                         st.error(f"❌ HTTP {resp.status_code}: {resp.text}")
                 except requests.ConnectionError:

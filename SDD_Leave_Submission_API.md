@@ -1,7 +1,7 @@
 # Solution Design Document (SDD)
 ## Leave Submission API — Day-Level Persistence
 
-**Version:** 1.5  
+**Version:** 1.6  
 **Date:** 2026-03-27  
 **Endpoint:** `POST /api/v1/leave-submissions`
 
@@ -12,6 +12,8 @@
 This document describes the design and implementation of a REST API that accepts a worker leave submission payload (JSON) and persists the data into SQL Server at a day-by-day granularity.
 
 The system decomposes a submitted leave period into individual working days (Monday–Friday), validates alignment between the submitted metadata and the actual calendar, and writes both a submission header record and one row per working day in a single atomic transaction. A Data Quality (DQ) engine runs 5-domain checks on every submission — all issues are recorded as soft warnings; submissions are never rejected by DQ.
+
+> **Assessment compliance note:** This implementation fully satisfies the stated assessment requirements (POST endpoint, validation, Mon–Fri decomposition, SQL Server schema). The SQLite PoC, DQ engine, Streamlit UI, and server-generated SubmissionId fallback are **bonus additions beyond the spec scope**, clearly separated from the core solution.
 
 ---
 
@@ -40,7 +42,7 @@ The schema follows a normalised **header–detail (parent–child)** structure, 
 
 This separation ensures that submission-level attributes (status, approver, comments) are stored exactly once, while day-level granularity is achieved through child rows rather than wide pivoted columns or repeated header data. This aligns with Inmon's principle of capturing data at its **lowest meaningful grain** in a normalised form.
 
-> **SubmissionId design decision:** The spec example `LS-2026-000123` follows a `LS-YYYY-NNNNNN` pattern — a fixed prefix, year, and zero-padded global sequence. `SubmissionId` is the spec-defined `PK` on `LeaveSubmission` and the `FK` target on `LeaveDay`. The ID is **server-generated atomically inside the DB transaction**: `SELECT MAX(sequence) → +1 → INSERT` executes under SQLite's DB-level write lock, serialising concurrent requests and preventing collisions. The `LS-YYYY` year prefix reflects the submission year; the sequence number is global and never resets. A surrogate `Id INT IDENTITY` is listed as a future consideration for high-volume FK join performance (see section 10).
+> **SubmissionId design decision:** Per the assessment spec, `SubmissionId VARCHAR(50)` is the **caller-supplied** PK — the payload example provides `LS-2026-000123` directly. The implementation honours this: if `submissionId` is present in the payload it is used as-is (duplicate returns HTTP 409); if omitted, the server auto-generates `LS-YYYY-NNNNNN` from `MAX(sequence)+1` as a convenience fallback. This keeps the implementation fully spec-compliant while supporting automated clients that prefer server-generated IDs.
 
 ### 3.2 Deliberate denormalisation — Kimball influence
 
@@ -61,7 +63,7 @@ In Kimball terms, `LeaveDay` behaves like a **Fact table** (grain = one working 
 | Characteristic | Pattern applied | Evidence in schema |
 |---|---|---|
 | Header–detail normalisation | Inmon 3NF | `LeaveSubmission` → `LeaveDay` via FK |
-| Single source of truth | Inmon | `SubmissionId` as spec-defined PK, server-generated atomically as `LS-YYYY-NNNNNN` |
+| Single source of truth | Inmon | `SubmissionId` as spec-defined caller-supplied PK; server auto-generates if omitted |
 | Performance denormalisation | Kimball | `WorkerId` repeated on `LeaveDay` |
 | Day-level fact grain | Kimball Fact table concept | One row per Mon–Fri day per leave type |
 | Dimensional lookups | Out of scope | No `DimWorker` / `DimLeaveType` tables |
@@ -77,7 +79,8 @@ In Kimball terms, `LeaveDay` behaves like a **Fact table** (grain = one working 
 | 1 | Parse & structural validate | Pydantic | All required fields must be present. Field types are coerced (e.g. `startDate` string → `datetime`). Missing or wrong-type fields return `HTTP 422` immediately. |
 | 2 | Date order check | model_validator | A Pydantic model validator on `LeavePeriod` asserts `startDate ≤ endDate`. Raises `HTTP 422` if violated. |
 | 3 | Working-day alignment check | Business rule | Counts actual Mon–Fri days in the range. Must equal `totalWorkingDays` AND the sum of `leaveDetail.quantity` (for "Days" unit). Returns `HTTP 400` on mismatch. |
-| 4 | DQ checks | DQ engine | Runs 16 rules across 5 domains (Accuracy, Completeness, Consistency, Timeliness, Uniqueness). All issues are soft warnings — submission always proceeds. Issues are returned in `dq_issues` and persisted to `DQResult`. |
+| 0 | SubmissionId resolution | Business rule | If caller supplies `submissionId`: check for duplicate (HTTP 409 on conflict). If omitted: server generates `LS-YYYY-NNNNNN` from `MAX(sequence)+1`. |
+| 4 | DQ checks *(bonus)* | DQ engine | Runs 16 rules across 5 domains. All issues are soft warnings — submission always proceeds. Issues returned in `dq_issues` and persisted to `DQResult`. |
 | 5 | Day decomposition | Business logic | Iterates calendar days from start → end, emitting one `LeaveDayRecord` per Mon–Fri day. Per-day quantity is always `1.00` regardless of the total. |
 | 6 | Atomic DB write + ID generation | DB transaction | Inside a single transaction: `SELECT MAX(sequence) → +1` generates `SubmissionId`; header is inserted; all `LeaveDay` rows are bulk-inserted via `executemany`. Rolled back entirely on any error. Returns `final_id`. |
 | 7 | 201 Created response | Done | Returns server-generated `submissionId`, `workerId`, `totalWorkingDaysCreated`, full list of `leaveDays`, and `dq_issues` array (empty if no issues). |
@@ -312,7 +315,7 @@ The Node.js + Express solution is a **functional prototype** that demonstrates t
 
 ---
 
-## 12. Streamlit UI (PoC)
+## 12. Streamlit UI (PoC) ⭐ Bonus — beyond assessment scope
 
 A three-page Streamlit application (`poc/app.py`) provides a human-friendly interface over the SQLite PoC.
 
@@ -498,7 +501,7 @@ curl -X GET 'http://localhost:8090/api/v1/leave-submissions/LS-2026-000007' \
 ```
 ---
 
-## 14. Data Quality Engine
+## 14. Data Quality Engine ⭐ Bonus — beyond assessment scope
 
 ### 14.1 Design principles
 

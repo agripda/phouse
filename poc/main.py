@@ -46,8 +46,16 @@ from database_sqlite import (
     get_next_sequence,
     persist_dq_results,
     persist_submission,
+    submission_exists,
 )
 from dq_engine import run_dq_checks
+
+
+def _generate_id_from_db() -> str:
+    """Generate next LS-YYYY-NNNNNN from DB MAX sequence (server fallback)."""
+    year = datetime.now().strftime("%Y")
+    seq  = get_next_sequence()
+    return f"LS-{year}-{seq:06d}"
 from db_setup import create_database
 from models import ErrorResponse, GetSubmissionResponse, LeaveSubmissionResponse, SubmitLeaveRequest
 
@@ -248,18 +256,36 @@ SAMPLE_LEAVE_SUBMISSION = {
     },
     summary="Submit a worker leave request",
     tags=["Leave"],
-    description="Submit a worker leave request. `submissionId` is server-generated (LS-YYYY-NNNNNN) — omit or leave null. Use the sample schema provided below.",
+    description="Submit a worker leave request. `submissionId` is caller-supplied per spec (e.g. LS-2026-000123). If omitted, server auto-generates LS-YYYY-NNNNNN. Duplicate submissionId returns HTTP 409.",
 )
 async def submit_leave(
     body: SubmitLeaveRequest = Body(
         ...,
-        examples=SAMPLE_LEAVE_SUBMISSION,
+        example=SAMPLE_LEAVE_SUBMISSION,
         description="Leave submission payload. Use the sample schema as reference.",
     ),
 ) -> LeaveSubmissionResponse:
     submission = body.leaveSubmission
-    msg = f"[LEAVE_POC.submit_leave] Received request workerId={submission.worker.workerId}"
+    msg = f"[LEAVE_POC.submit_leave] Received request workerId={submission.worker.workerId} submissionId={submission.submissionId}"
     logger and writelog(logger, msg, "info") or print(msg)
+
+    # Step 0 — SubmissionId: use caller-supplied if present, else server-generate
+    if submission.submissionId:
+        # Spec path: caller supplied — check for duplicate
+        if submission_exists(submission.submissionId):
+            msg = f"[LEAVE_POC.submit_leave] ⚠️  Duplicate submissionId={submission.submissionId}"
+            logger and writelog(logger, msg, "warning") or print(msg)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Submission '{submission.submissionId}' already exists.",
+            )
+        msg = f"[LEAVE_POC.submit_leave] Using caller-supplied submissionId={submission.submissionId}"
+        logger and writelog(logger, msg, "info") or print(msg)
+    else:
+        # Fallback: server generates LS-YYYY-NNNNNN from DB MAX sequence
+        submission.submissionId = _generate_id_from_db()
+        msg = f"[LEAVE_POC.submit_leave] Server-generated submissionId={submission.submissionId}"
+        logger and writelog(logger, msg, "info") or print(msg)
 
     # Step 1 — Working-day alignment
     try:
@@ -283,22 +309,12 @@ async def submit_leave(
     msg = f"[LEAVE_POC.submit_leave] Decomposed into {len(leave_days)} working-day records"
     logger and writelog(logger, msg, "info") or print(msg)
 
-    # Step 3 — Persist (atomic sequence generated inside DB transaction)
+    # Step 3 — Persist
     try:
         result = persist_submission(submission, leave_days)
-        # result is final_id (str) from updated database_sqlite.py
-        # falls back to DB MAX query if local file returns None
-        if result and isinstance(result, str):
-            final_id = result
-        else:
-            year = submission.submittedDate.strftime("%Y")
-            seq  = get_next_sequence() - 1   # already inserted, so MAX is current
-            final_id = f"LS-{year}-{seq:06d}"
-            msg = f"[LEAVE_POC.submit_leave] ⚠️  persist_submission returned None — recovered id={final_id}"
-            logger and writelog(logger, msg, "warning") or print(msg)
+        final_id = result if result and isinstance(result, str) else submission.submissionId
         msg = f"[LEAVE_POC.submit_leave] ✅ Persisted submissionId={final_id}"
         logger and writelog(logger, msg, "info") or print(msg)
-        # Persist all DQ issues (soft warnings — submission always proceeds)
         if dq_result.issues:
             persist_dq_results(final_id, dq_result.to_dict_list())
     except Exception as exc:

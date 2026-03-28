@@ -166,15 +166,8 @@ def persist_submission(
     _log(f"[DB.persist_submission] START workerId={payload.worker.workerId} days={len(leave_days)}")
     with get_connection() as conn:
 
-        # Atomic sequence: MAX read + INSERT happen under the same write lock
-        row = conn.execute(
-            "SELECT MAX(CAST(SUBSTR(SubmissionId, 9) AS INTEGER)) FROM LeaveSubmission"
-        ).fetchone()
-        max_seq  = row[0] if row and row[0] is not None else 0
-        next_seq = max_seq + 1
-        year     = payload.submittedDate.strftime("%Y")
-        final_id = f"LS-{year}-{next_seq:06d}"
-        _log(f"[DB.persist_submission] Atomic sequence → {final_id} (MAX was {max_seq})")
+        final_id = payload.submissionId
+        _log(f"[DB.persist_submission] Using submissionId={final_id}")
 
         # 1. Insert submission header
         _log(f"[DB.persist_submission] Inserting LeaveSubmission header")

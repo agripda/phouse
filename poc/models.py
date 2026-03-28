@@ -47,11 +47,10 @@ class Approver(BaseModel):
 
 
 class LeaveSubmissionPayload(BaseModel):
-    submissionId: str = Field(
-        ...,
-        min_length=1,
+    submissionId: Optional[str] = Field(
+        default=None,
         max_length=50,
-        description="Caller-supplied unique ID e.g. LS-2026-000123",
+        description="Caller-supplied (e.g. LS-2026-000123). If omitted, server auto-generates LS-YYYY-NNNNNN.",
     )
     submittedDate: date
     status: str = Field(..., max_length=20)
