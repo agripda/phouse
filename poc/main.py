@@ -69,7 +69,10 @@ _BASE_DIR = Path(__file__).parent
 DB_PATH           = str((_BASE_DIR / os.environ.get("POWERHOUSE_DB_PATH", "data/leave.db")).resolve()) \
                     if not Path(os.environ.get("POWERHOUSE_DB_PATH", "data/leave.db")).is_absolute() \
                     else os.environ.get("POWERHOUSE_DB_PATH", "data/leave.db")
-LOG_DATAPATH      = os.environ.get("POWERHOUSE_LOG_DATAPATH",      "logs")
+_raw_log          = os.environ.get("POWERHOUSE_LOG_DATAPATH", "logs")
+LOG_DATAPATH      = str((_BASE_DIR / _raw_log).resolve()) \
+                    if not Path(_raw_log).is_absolute() \
+                    else _raw_log
 POC_SERVER_PORT   = int(os.environ.get("POWERHOUSE_POC_SERVER_PORT", 8090))
 LEAVE_API_ENABLED = os.environ.get("POWERHOUSE_LEAVE_API_ENABLED", "true").lower() == "true"
 
@@ -295,13 +298,26 @@ async def submit_leave(
         logger and writelog(logger, msg, "warning") or print(msg)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
-    # Step 2 — DQ checks (5 domains, soft warnings only — submission always proceeds)
+    # Step 2 — DQ checks (5 domains)
+    # Critical issues (e.g. UNQ-001 overlapping dates) → HTTP 400, nothing saved
+    # Warning issues → submission proceeds, recorded in DQResult
     dq_result = run_dq_checks(
         submission,
         existing_dates_fn=get_existing_leave_dates,
     )
-    if dq_result.issues:
-        msg = f"[LEAVE_POC.submit_leave] DQ — {len(dq_result.issues)} issue(s): {[i.code for i in dq_result.issues]}"
+    if not dq_result.passed:
+        critical = dq_result.critical_issues
+        msg = f"[LEAVE_POC.submit_leave] ❌ DQ CRITICAL — rejected: {[i.code for i in critical]}"
+        logger and writelog(logger, msg, "warning") or print(msg)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": "Submission rejected due to critical DQ issue.",
+                "dq_issues": dq_result.to_dict_list(),
+            },
+        )
+    if dq_result.warning_issues:
+        msg = f"[LEAVE_POC.submit_leave] DQ WARNING — {len(dq_result.warning_issues)} issue(s): {[i.code for i in dq_result.warning_issues]}"
         logger and writelog(logger, msg, "info") or print(msg)
 
     # Step 2 — Decompose into working days

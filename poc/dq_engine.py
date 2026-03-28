@@ -229,11 +229,11 @@ def _check_uniqueness(
         cur += timedelta(days=1)
 
     if overlapping:
-        issues.append(DQIssue(D, S.WARNING, "UNQ-001",
+        issues.append(DQIssue(D, S.CRITICAL, "UNQ-001",
             f"Worker '{p.worker.workerId}' already has leave recorded on "
             f"{len(overlapping)} date(s) in this range: {overlapping[:5]}"
             f"{'...' if len(overlapping) > 5 else ''}. "
-            "Possible overlapping submission.",
+            "Submission rejected — overlapping leave dates are not allowed.",
             field="leavePeriod"))
 
     return issues
@@ -283,5 +283,5 @@ def run_dq_checks(
     all_issues += _check_timeliness(payload)
     all_issues += _check_uniqueness(payload, existing_dates_fn)
 
-    passed = True   # all issues are soft — submission always proceeds
+    passed = not any(i.is_critical() for i in all_issues)
     return DQResult(issues=all_issues, passed=passed)

@@ -29,13 +29,16 @@ HAS_DIALOG  = _ST_VERSION >= (1, 36)
 # ── Config ────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-BASE_DIR  = Path(__file__).parent
-DB_PATH   = Path(os.environ.get("POWERHOUSE_DB_PATH", BASE_DIR / "data" / "leave.db"))
-if not DB_PATH.is_absolute():
-    DB_PATH = (BASE_DIR / DB_PATH).resolve()
+BASE_DIR = Path(__file__).parent
 
-API_PORT  = int(os.environ.get("POWERHOUSE_POC_SERVER_PORT", 8090))
-API_BASE  = f"http://localhost:{API_PORT}/api/v1"
+# Resolve DB_PATH the same way main.py does:
+# relative paths are anchored to __file__ dir, so both processes always
+# resolve to the same absolute path regardless of working directory.
+_raw_db = os.environ.get("POWERHOUSE_DB_PATH", "data/leave.db")
+DB_PATH = Path(_raw_db) if Path(_raw_db).is_absolute() else (BASE_DIR / _raw_db).resolve()
+
+API_PORT = int(os.environ.get("POWERHOUSE_POC_SERVER_PORT", 8090))
+API_BASE = f"http://localhost:{API_PORT}/api/v1"
 
 # ── Page setup ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -55,7 +58,10 @@ page = st.sidebar.radio(
 )
 st.sidebar.markdown("---")
 st.sidebar.caption(f"API: `{API_BASE}`")
-st.sidebar.caption(f"DB:  `{DB_PATH.relative_to(BASE_DIR)}`")
+st.sidebar.caption(f"DB:  `{DB_PATH}`")
+# Warn if DB doesn't exist yet
+if not DB_PATH.exists():
+    st.sidebar.warning("⚠️ DB file not found — start the API first.")
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────
@@ -122,15 +128,22 @@ def show_dq_result(submission_id: str, dq_issues: list, total_days: int) -> None
 
     if HAS_DIALOG:
         # ── Native modal dialog ───────────────────────────────────────────────
-        @st.dialog("⚠️ Submission accepted with DQ warnings")
+        @st.dialog("✅ Submission saved — DQ warnings recorded")
         def _dialog():
+            # Success confirmation — prominent green
             st.markdown(
-                f"**Submission ID:** `{submission_id}`  &nbsp;·&nbsp; "
-                f"**{total_days}** working days recorded",
+                f"<div style='background:#eaf3de;border-left:4px solid #27ae60;"
+                f"padding:10px 14px;border-radius:4px;margin-bottom:12px'>"
+                f"<span style='font-size:14px;font-weight:600;color:#27ae60'>"
+                f"Saved to database ✅</span><br>"
+                f"<span style='font-size:13px;color:#3b6d11'>"
+                f"Submission ID: <code>{submission_id}</code> &nbsp;·&nbsp; "
+                f"{total_days} working day(s) recorded</span></div>",
+                unsafe_allow_html=True,
             )
             st.caption(
-                "The submission was saved successfully. The following Data Quality "
-                "warnings have been recorded for governance review."
+                f"The following {len(dq_issues)} Data Quality warning(s) were recorded "
+                f"for governance review. The submission is already in the database."
             )
             st.divider()
             _dq_issue_rows(dq_issues)
@@ -189,6 +202,10 @@ def next_submission_id() -> str:
 if page == "📝 Submit Leave":
     st.title("📝 Submit Leave Request")
 
+    # ── Session state: track last successful submission ───────────────────────
+    if "last_submission" not in st.session_state:
+        st.session_state.last_submission = None
+
     # Auto-generate next SubmissionId outside the form (not cached across reruns)
     auto_id = next_submission_id()
 
@@ -207,6 +224,20 @@ if page == "📝 Submit Leave":
         st.warning("⚠️ No working days in selected range.")
     else:
         st.info(f"⏱ Working days in selected range: **{wd}**")
+
+    # ── Show success banner if just submitted for this date range ─────────────
+    last = st.session_state.last_submission
+    already_submitted = (
+        last is not None
+        and last["start"] == str(start_date)
+        and last["end"] == str(end_date)
+    )
+    if already_submitted:
+        st.success(
+            f"✅ **{last['id']}** already submitted for "
+            f"{start_date} → {end_date}. "
+            f"Change the dates to make a new submission."
+        )
 
     st.markdown("---")
 
@@ -256,7 +287,11 @@ if page == "📝 Submit Leave":
         with acol2:
             approval_status = st.selectbox("Approval Status", ["Pending", "Approved", "Rejected"])
 
-        submitted = st.form_submit_button("🚀 Submit Leave Request", use_container_width=True)
+        submitted = st.form_submit_button(
+            "🚀 Submit Leave Request",
+            use_container_width=True,
+            disabled=already_submitted,   # prevent re-submit for same dates
+        )
 
     if submitted:
         errors = []
@@ -311,6 +346,13 @@ if page == "📝 Submit Leave":
                         data = resp.json()
                         dq_issues = data.get("dq_issues", [])
 
+                        # Record in session state to warn on duplicate submit
+                        st.session_state.last_submission = {
+                            "id":    data["submissionId"],
+                            "start": str(start_date),
+                            "end":   str(end_date),
+                        }
+
                         # Show result — modal dialog or fallback based on Streamlit version
                         show_dq_result(
                             submission_id=data["submissionId"],
@@ -336,14 +378,32 @@ if page == "📝 Submit Leave":
                         else:
                             st.error(f"❌ Retry failed HTTP {resp2.status_code}: {resp2.text}")
                     elif resp.status_code == 400:
-                        detail = resp.json().get("detail", resp.text)
-                        st.error("❌ Validation failed")
-                        st.markdown(
-                            f"<div style='background:#fcebeb;border-left:4px solid #a32d2d;"
-                            f"padding:10px 14px;border-radius:4px;font-size:13px;color:#a32d2d'>"
-                            f"{detail}</div>",
-                            unsafe_allow_html=True,
-                        )
+                        try:
+                            detail = resp.json().get("detail", resp.text)
+                        except Exception:
+                            detail = resp.text
+
+                        # DQ Critical rejection (e.g. UNQ-001 overlap)
+                        if isinstance(detail, dict) and "dq_issues" in detail:
+                            dq_issues = detail["dq_issues"]
+                            st.error("❌ Submission rejected — **not saved to database**")
+                            with st.expander(
+                                f"🚫 {len(dq_issues)} critical DQ issue(s) — click to review",
+                                expanded=True,
+                            ):
+                                st.caption(
+                                    "The submission was **not saved**. "
+                                    "Resolve the issues below and resubmit."
+                                )
+                                _dq_issue_rows(dq_issues)
+                        else:
+                            st.error("❌ Validation failed — not saved")
+                            st.markdown(
+                                f"<div style='background:#fcebeb;border-left:4px solid #a32d2d;"
+                                f"padding:10px 14px;border-radius:4px;font-size:13px;color:#a32d2d'>"
+                                f"{detail}</div>",
+                                unsafe_allow_html=True,
+                            )
                     else:
                         st.error(f"❌ HTTP {resp.status_code}: {resp.text}")
                 except requests.ConnectionError:
