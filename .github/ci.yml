@@ -1,0 +1,188 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# ci.yml — GitHub Actions CI for Leave Submission API (PoC)
+#
+# Triggers: push / PR to main
+# Jobs:
+#   1. test    — pytest (in-memory SQLite, no infrastructure needed)
+#   2. api     — spin up uvicorn, hit /health, run live POST/GET smoke tests
+#
+# To enable deploy job: add RAILWAY_TOKEN (or equivalent) to repo Secrets
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: CI — Leave Submission API
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11"
+  API_PORT: 8090
+
+jobs:
+
+  # ── Job 1: Unit + Integration tests (pytest, in-memory SQLite) ────────────
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: poc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: poc/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest
+        env:
+          POWERHOUSE_DB_PATH: ":memory:"
+          POWERHOUSE_LEAVE_API_ENABLED: "true"
+          POWERHOUSE_LOG_DATAPATH: logs
+        run: |
+          pytest tests/ -v --tb=short
+
+  # ── Job 2: Live API smoke test (uvicorn + SQLite file DB) ─────────────────
+  smoke:
+    name: API smoke test
+    runs-on: ubuntu-latest
+    needs: test               # only runs if pytest passes
+
+    defaults:
+      run:
+        working-directory: poc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: poc/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start API server (background)
+        env:
+          POWERHOUSE_DB_PATH: data/leave.db
+          POWERHOUSE_POC_SERVER_PORT: ${{ env.API_PORT }}
+          POWERHOUSE_LEAVE_API_ENABLED: "true"
+          POWERHOUSE_LOG_DATAPATH: logs
+        run: |
+          uvicorn main:app --port ${{ env.API_PORT }} &
+          echo "API_PID=$!" >> $GITHUB_ENV
+
+      - name: Wait for API to be ready
+        run: |
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:${{ env.API_PORT }}/health; then
+              echo "✅ API ready"
+              break
+            fi
+            echo "Waiting... ($i/20)"
+            sleep 1
+          done
+
+      - name: Health check
+        run: |
+          curl -sf http://localhost:${{ env.API_PORT }}/health | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert data['status'] == 'ok', f'Health check failed: {data}'
+          print('✅ /health OK:', data)
+          "
+
+      - name: POST — submit leave request
+        run: |
+          RESPONSE=$(curl -sf -X POST \
+            http://localhost:${{ env.API_PORT }}/api/v1/leave-submissions \
+            -H "Content-Type: application/json" \
+            -d '{
+              "leaveSubmission": {
+                "submittedDate": "2026-02-15",
+                "status": "Submitted",
+                "worker": {
+                  "workerId": "W123456",
+                  "employeeNumber": "90030366",
+                  "sourceSystem": "HRIS"
+                },
+                "leavePeriod": {
+                  "startDate": "2026-03-02 00:00:00.00",
+                  "endDate": "2026-03-20 23:59:59.99",
+                  "totalWeeks": 3,
+                  "totalWorkingDays": 15
+                },
+                "leaveDetails": [{
+                  "leaveTypeCode": "AL",
+                  "leaveTypeDescription": "Annual Leave",
+                  "leaveCategory": "Paid",
+                  "unitOfMeasure": "Days",
+                  "quantity": 15
+                }],
+                "approver": {
+                  "approverId": "M987654",
+                  "approvalStatus": "Pending"
+                },
+                "comments": "CI smoke test"
+              }
+            }')
+          echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert data['totalWorkingDaysCreated'] == 15, f'Expected 15 days, got {data}'
+          assert data['submissionId'].startswith('LS-'), f'Bad submissionId: {data}'
+          print('✅ POST OK:', data['submissionId'], '—', data['totalWorkingDaysCreated'], 'days')
+          "
+          echo "SUBMISSION_ID=$(echo $RESPONSE | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"submissionId\"])')" >> $GITHUB_ENV
+
+      - name: GET — retrieve submission
+        run: |
+          curl -sf http://localhost:${{ env.API_PORT }}/api/v1/leave-submissions/${{ env.SUBMISSION_ID }} \
+          | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert len(data['leaveDays']) == 15, f'Expected 15 day rows, got {len(data[\"leaveDays\"])}'
+          print('✅ GET OK:', data['submission']['SubmissionId'], '—', len(data['leaveDays']), 'day rows')
+          "
+
+      - name: Stop API server
+        if: always()
+        run: kill ${{ env.API_PID }} || true
+
+  # ── Job 3: Deploy to Railway (optional — requires RAILWAY_TOKEN secret) ───
+  # Uncomment and add RAILWAY_TOKEN to repo Settings → Secrets
+  #
+  # deploy:
+  #   name: Deploy to Railway
+  #   runs-on: ubuntu-latest
+  #   needs: [test, smoke]
+  #   if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+  #
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Install Railway CLI
+  #       run: npm install -g @railway/cli
+  #
+  #     - name: Deploy
+  #       env:
+  #         RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+  #       run: |
+  #         cd poc
+  #         railway up --service leave-submission-api

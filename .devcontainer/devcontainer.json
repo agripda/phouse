@@ -1,0 +1,44 @@
+{
+  "name": "Leave Submission API — PoC",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+
+  "workspaceFolder": "/workspaces/phouse",
+
+  "postCreateCommand": "pip install -r poc/requirements.txt",
+
+  "postStartCommand": "bash .devcontainer/start.sh",
+
+  "forwardPorts": [8090, 8501],
+  "portsAttributes": {
+    "8090": {
+      "label": "FastAPI  — /api/v1/leave-submissions",
+      "onAutoForward": "notify"
+    },
+    "8501": {
+      "label": "Streamlit UI",
+      "onAutoForward": "openBrowser"
+    }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.pylint",
+        "rangav.vscode-thunder-client",
+        "yzhang.markdown-all-in-one"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+
+  "remoteEnv": {
+    "POWERHOUSE_DB_PATH": "data/leave.db",
+    "POWERHOUSE_POC_SERVER_PORT": "8090",
+    "POWERHOUSE_LEAVE_API_ENABLED": "true",
+    "POWERHOUSE_LOG_DATAPATH": "logs"
+  }
+}
