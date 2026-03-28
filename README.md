@@ -3,6 +3,8 @@
 REST API that accepts a worker leave submission (JSON) and persists the data
 at day-by-day granularity. Assessment task implementation with SQLite PoC.
 
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/agripda/phouse?quickstart=1)
+
 ---
 
 ## File structure
@@ -61,21 +63,27 @@ pip install -r requirements.txt
 
 ---
 
-## Quick start — SQLite PoC
+## Quick start — SQLite PoC (local)
 
 ```bash
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Start API  (port from .env: POWERHOUSE_POC_SERVER_PORT=8090)
-#    DB is created automatically on first startup
+# 2. Start API
 uvicorn main:app --port 8090 --reload
 
 # 3. Start Streamlit UI  (optional)
 streamlit run app.py
 
-# 4. Run tests  (no DB file needed — uses in-memory SQLite)
+# 4. Run tests
 pytest tests/ -v
+```
+
+Access locally:
+```
+Streamlit UI:    http://localhost:8501
+FastAPI Swagger: http://localhost:8090/docs
+FastAPI Health:  http://localhost:8090/health
 ```
 
 ---
@@ -163,3 +171,55 @@ All others are soft warnings — submission proceeds and issues are recorded.
 | Consistency | CON-001 – CON-003 | — |
 | Timeliness | TML-001 – TML-003 | — |
 | Uniqueness | UNQ-001 | ✅ HTTP 400 reject |
+
+---
+
+## Appendix — GitHub Codespaces
+
+> **Note:** Codespaces URLs (`*.app.github.dev`) change each time a new Codespace is created.
+> Reusing the same Codespace (Stop → Start) keeps the same URL.
+
+**Step 1 — Start a Codespace**
+- Click the badge above, **or**
+- Go to the repo → green **Code** button → **Codespaces** tab → **Create codespace on main**
+
+**Step 2 — Wait ~60 seconds**
+
+The environment auto-installs dependencies and starts both services:
+
+| Port | Service | URL (Codespaces) |
+|---|---|---|
+| `8501` | Streamlit UI | Opens automatically in a browser tab |
+| `8090` | FastAPI + Swagger | **PORTS** tab → click 🌐 next to port 8090 → add `/docs` |
+
+**Step 3 — Make ports public (for sharing)**
+
+```
+PORTS tab → right-click 8090 → Port Visibility → Public
+PORTS tab → right-click 8501 → Port Visibility → Public
+```
+
+Share the URLs (find exact name in the PORTS tab → click 🌐):
+```
+# Format: https://<codespace-name>-<port>.app.github.dev
+Streamlit UI:    https://<codespace-name>-8501.app.github.dev
+FastAPI Swagger: https://<codespace-name>-8090.app.github.dev/docs
+```
+
+> ℹ️ For local `git clone`, use `http://localhost:8501` and `http://localhost:8090/docs` instead.
+
+**Step 4 — If services didn't start automatically**
+
+```bash
+cd poc
+uvicorn main:app --host 0.0.0.0 --port 8090 --reload &
+streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true &
+```
+
+**Quick smoke test:**
+
+```bash
+curl -s http://localhost:8090/health | python3 -m json.tool
+```
+
+> **Free tier:** GitHub accounts get 60 hrs/month of Codespaces time.

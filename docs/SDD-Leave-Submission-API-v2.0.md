@@ -7,7 +7,7 @@
 
 ```
 Document Title:  Leave Submission API — Day-Level Persistence
-Version:         2.0
+Version:         2.1
 Date:            2026-03-29
 Author(s):       David
 Reviewer(s):     —
@@ -24,6 +24,7 @@ Approver(s):     —
 | 1.6 | 2026-03-27 | David | Assessment compliance note + dual-mode SubmissionId |
 | 1.7 | 2026-03-29 | David | SQL Server SP layer, UNQ-001 hard reject, Appendix restructure |
 | 2.0 | 2026-03-29 | David | Full restructure to standard SDD template |
+| 2.1 | 2026-03-29 | David | Power BI Gold-layer detail, Kafka integration, DAMS applicability note |
 
 ---
 
@@ -410,9 +411,12 @@ JSON Payload (POST)
 |---|---|---|---|---|
 | HRIS | Worker master data | REST (read-only) | Inbound reference | `WorkerId` validated by pattern only in PoC; FK to worker table out of scope |
 | Payroll | Leave export | Batch / API | Outbound | Downstream consumer of `dbo.LeaveDay` day-level records |
+| Event bus (future) | Submission events | Kafka / Service Bus | Outbound | Publish `LeaveSubmitted` event on 201 — enables downstream consumers (Payroll, DAMS, notifications) to subscribe without polling |
 | Streamlit UI ⭐ | HTTP REST | HTTP (localhost) | Inbound | Calls `POST /api/v1/leave-submissions` and reads SQLite directly for balance/admin pages |
 
 > No live integration is implemented in this PoC. `WorkerId` is accepted as a bare string; HRIS and Payroll are identified as future integration targets.
+
+> **Museum / DAMS applicability note:** The same header-detail pattern, DQ engine, and metadata governance model applied here translates directly to collection asset ingestion workflows — replacing `LeaveSubmission` with a collection item record and `LeaveDay` with asset-level provenance or digitisation event rows. The DQ domain rules (Accuracy, Completeness, Consistency) map cleanly to collection metadata standards (e.g. Dublin Core, Spectrum).
 
 ---
 
@@ -580,7 +584,7 @@ Developer machine
 | Approval workflow | Status field only — no workflow engine | Event-driven approval via message queue |
 | Surrogate PK | `SubmissionId VARCHAR(50)` as PK — slower FK joins | Add `Id INT IDENTITY` surrogate PK for high-volume join scenarios |
 | Worker dimension | `WorkerId` bare string, no FK | Add `dbo.Worker` reference table + referential integrity |
-| Analytical reporting | OLTP schema only | Gold-layer view or Star Schema projection for reporting |
+| Analytical reporting / Power BI | OLTP schema only | Add a Gold-layer view (`vw_LeaveDay_Gold`) as a Star Schema projection over `dbo.LeaveDay` — directly connectable to Power BI as a semantic layer without schema changes |
 | HRIS integration | `WorkerId` accepted as-is | Live validation against HRIS worker API |
 
 ---
