@@ -1,0 +1,2 @@
+LeaveDayId,SubmissionId,WorkerId,LeaveDate,LeaveTypeCode,LeaveCategory,UnitOfMeasure,Quantity
+1,LS-2026-000001,W123456,2026-03-30,AL,Paid,Days,1.0
