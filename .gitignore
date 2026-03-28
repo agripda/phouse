@@ -1,24 +1,35 @@
-# Byte-compiled / cache
+# ── Python ────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
-
-# Virtual environments
+*.pyd
+.pytest_cache/
+ 
+# ── Virtual environments ───────────────────────────────────
 venv/
-.env/
-env/
 .venv/
-
-# Environment variables
+env/
+.env/
+ 
+# ── Environment variables (never commit secrets) ───────────
+.env
 .env.local
-
-# IDE
+.env.*.local
+ 
+# ── SQLite database files ──────────────────────────────────
+poc/data/
+*.db
+*.sqlite3
+ 
+# ── Log files ─────────────────────────────────────────────
+poc/logs/
+*.log
+ 
+# ── IDE ───────────────────────────────────────────────────
 .vscode/
 .idea/
-
-# OS
+ 
+# ── OS ────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-
-# Logs
-*.log
+ 
