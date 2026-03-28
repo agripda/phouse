@@ -30,6 +30,37 @@ poc/                          ← SQLite PoC (run locally, no infrastructure)
 
 ---
 
+## Installation and CLI
+
+### Installation
+
+**Clone the repository:**
+
+```bash
+git clone https://github.com/agripda/phouse.git
+cd phouse/poc
+```
+
+**Create and activate a virtual environment:**
+
+```bash
+python -m venv venv
+
+# Windows
+venv\Scripts\activate
+
+# macOS / Linux
+source venv/bin/activate
+```
+
+**Install dependencies:**
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
 ## Quick start — SQLite PoC
 
 ```bash
