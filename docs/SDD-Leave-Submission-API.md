@@ -9,7 +9,7 @@
 Document Title:  Leave Submission API — Day-Level Persistence
 Version:         2.1
 Date:            2026-03-29
-Author(s):       David
+Author(s):       Bomyung Kim
 Reviewer(s):     —
 Approver(s):     —
 ```
@@ -24,7 +24,7 @@ Approver(s):     —
 | 1.6 | 2026-03-27 | David | Assessment compliance note + dual-mode SubmissionId |
 | 1.7 | 2026-03-29 | David | SQL Server SP layer, UNQ-001 hard reject, Appendix restructure |
 | 2.0 | 2026-03-29 | David | Full restructure to standard SDD template |
-| 2.1 | 2026-03-29 | David | Power BI Gold-layer detail, Kafka integration, DAMS applicability note |
+
 
 ---
 
