@@ -1,368 +1,192 @@
 # Solution Design Document (SDD)
 ## Leave Submission API — Day-Level Persistence
 
-**Version:** 1.7  
-**Date:** 2026-03-29  
-**Endpoint:** `POST /api/v1/leave-submissions`
+---
+
+## 1. Document Control
+
+```
+Document Title:  Leave Submission API — Day-Level Persistence
+Version:         2.1
+Date:            2026-03-29
+Author(s):       David
+Reviewer(s):     —
+Approver(s):     —
+```
+
+| Version | Date | Author | Description |
+|---|---|---|---|
+| 1.0 | 2026-03-27 | David | Initial draft — SQL Server production schema |
+| 1.2 | 2026-03-27 | David | SQLite PoC + Streamlit UI added |
+| 1.3 | 2026-03-27 | David | Atomic SubmissionId + concurrency handling |
+| 1.4 | 2026-03-27 | David | API specification section |
+| 1.5 | 2026-03-27 | David | DQ engine + DQResult table |
+| 1.6 | 2026-03-27 | David | Assessment compliance note + dual-mode SubmissionId |
+| 1.7 | 2026-03-29 | David | SQL Server SP layer, UNQ-001 hard reject, Appendix restructure |
+| 2.0 | 2026-03-29 | David | Full restructure to standard SDD template |
+| 2.1 | 2026-03-29 | David | Power BI Gold-layer detail, Kafka integration, DAMS applicability note |
 
 ---
 
-## 1. Overview
+## 2. Executive Summary
 
-This document describes the design and implementation of a REST API that accepts a worker leave submission payload (JSON) and persists the data into SQL Server at a day-by-day granularity.
+**Purpose**
 
-The system decomposes a submitted leave period into individual working days (Monday–Friday), validates alignment between the submitted metadata and the actual calendar, and writes both a submission header record and one row per working day in a single atomic transaction. A Data Quality (DQ) engine runs 5-domain checks on every submission. Most issues are soft warnings recorded for governance review; UNQ-001 (overlapping leave dates) is a Critical rule that hard-rejects the submission with HTTP 400 — nothing is persisted.
+Design and implement a REST API endpoint that accepts a worker leave submission payload (JSON) and persists the data into SQL Server at a day-by-day granularity. A SQLite-based PoC is provided for local development and demonstration without infrastructure dependencies.
 
-> **Assessment compliance note:** This implementation fully satisfies the stated assessment requirements (POST endpoint, validation, Mon–Fri decomposition, SQL Server schema). The SQLite PoC, DQ engine, Streamlit UI, and server-generated SubmissionId fallback are **bonus additions beyond the spec scope**, clearly separated from the core solution.
+**Scope**
+
+| In scope | Out of scope |
+|---|---|
+| POST `/api/v1/leave-submissions` — accept, validate, decompose, persist | Leave approval workflow |
+| GET `/api/v1/leave-submissions/{id}` — retrieve submission + day records | Worker master data / HRIS integration |
+| Mon–Fri working-day decomposition | Public holiday calendar |
+| SQL Server schema (`LeaveSubmission`, `LeaveDay`) + stored procedure | Part-day / half-day leave |
+| SQLite PoC with Streamlit UI ⭐ bonus | Authentication / authorisation |
+| DQ engine — 5 domains, 16 rules ⭐ bonus | Reporting / analytics layer |
+
+**Objectives**
+
+- Fully satisfy the assessment specification (POST endpoint, validation, Mon–Fri decomposition, SQL Server schema)
+- Demonstrate production-readiness: idempotency, atomic transactions, batch persistence, index-backed queries, full test coverage
+- Provide a locally runnable PoC (SQLite + Streamlit) as a bonus deliverable
+
+> **Assessment compliance note:** All bonus deliverables (SQLite PoC, DQ engine, Streamlit UI, server-generated SubmissionId fallback) are clearly separated from the core assessment solution.
 
 ---
 
-## 2. Architecture & Technology Stack
+## 3. Business Context
+
+**Problem Statement**
+
+Workers submit leave requests covering multi-day periods. The current approach stores only the header-level submission record, making it impossible to query leave usage at the individual calendar-day grain. This prevents accurate leave balance calculations, overlap detection, and regulatory reporting at the day level.
+
+**Stakeholders**
+
+| Role | Party | Interest |
+|---|---|---|
+| Business owner | HR Operations | Accurate leave records and balance visibility |
+| Developer | Assessment candidate | Demonstrate API + DB design skills |
+| System | HRIS | Source of worker master data (read-only reference) |
+| System | Payroll | Downstream consumer of day-level leave records |
+
+**Assumptions**
+
+- Working days are Monday–Friday only; public holidays are out of scope
+- `WorkerId` is a valid HRIS identifier — no FK enforcement to a worker table in scope
+- A single leave submission may contain multiple leave types (e.g. AL + SL in one period)
+- `submissionId` follows the pattern `LS-YYYY-NNNNNN`; caller may supply it or omit for server generation
+- Quantity per day row is always `1.00` regardless of the unit of measure
+
+**Constraints**
+
+| Category | Constraint |
+|---|---|
+| Technology | Python + FastAPI; SQL Server for production DB |
+| Schema | `LeaveSubmission` and `LeaveDay` column definitions are fixed by the assessment spec |
+| Timeline | Single-developer assessment task |
+| Infrastructure | PoC must run without SQL Server — SQLite used for local development |
+
+---
+
+## 4. Functional Requirements
+
+| ID | Requirement | Description | Priority |
+|---|---|---|---|
+| FR-01 | POST endpoint | Accept leave submission JSON at `POST /api/v1/leave-submissions` | High |
+| FR-02 | Payload validation | Validate required fields, field types, and `startDate ≤ endDate` | High |
+| FR-03 | Working-day alignment | Verify `totalWorkingDays` and quantity sum match actual Mon–Fri count | High |
+| FR-04 | Day decomposition | Expand leave period into one record per Mon–Fri working day | High |
+| FR-05 | Atomic persistence | Write `LeaveSubmission` header + all `LeaveDay` rows in a single transaction | High |
+| FR-06 | Idempotency | Return HTTP 409 if a duplicate `submissionId` is submitted | High |
+| FR-07 | GET endpoint | Retrieve a submission header and all its day records by `submissionId` | Medium |
+| FR-08 | Error responses | Return appropriate HTTP status codes (400, 409, 422, 500) with descriptive messages | High |
+| FR-09 | SubmissionId generation | Auto-generate `LS-YYYY-NNNNNN` from DB `MAX(sequence)+1` if caller omits the field | Medium |
+| FR-10 | DQ engine ⭐ | Run 16 data-quality rules across 5 domains on every submission | Bonus |
+| FR-11 | Overlap detection ⭐ | Reject (HTTP 400) submissions that overlap existing leave dates for the same worker | Bonus |
+| FR-12 | Streamlit UI ⭐ | Provide a 4-page web UI for submit, balance, admin, and DQ dashboard | Bonus |
+
+---
+
+## 5. Non-Functional Requirements
+
+| Category | Requirement |
+|---|---|
+| Performance | API response < 500 ms for a 15-day submission under normal load |
+| Scalability | Stateless FastAPI service — horizontally scalable behind a load balancer |
+| Availability | Target 99.9% uptime in production; SQLite PoC for local dev only |
+| Reliability | All DB writes are atomic (transaction + rollback) — no partial data persisted on failure |
+| Auditability | Full day-level traceability: every working day linked back to its parent `SubmissionId` |
+| Logging | Structured timestamped logs (`YYYY-MM-DD HH:MM:SS | LEVEL | [MODULE.fn] message`) written to file and stdout |
+| Testability | Business logic and validation are pure Python with no DB dependency — fully unit-testable; integration tests use in-memory SQLite |
+| Portability | DB layer is swappable (SQLite ↔ SQL Server) via a single env var — no other code changes required |
+| Security | API runs over HTTP in PoC; TLS 1.2+ required in production; no authentication implemented in scope |
+| Maintainability | DQ rules are isolated in `dq_engine.py` — adding a rule requires one function addition, no core changes |
+
+---
+
+## 6. High-Level Architecture
+
+**Architecture style:** RESTful API · Monolithic service (PoC) · Swappable DB layer
+
+```
+┌──────────────┐     POST/GET      ┌────────────────────────────────┐
+│   Client     │ ──────────────── ▶│        FastAPI (main.py)       │
+│ (curl/UI/API)│                   │                                │
+└──────────────┘                   │  ┌──────────────────────────┐  │
+                                   │  │  Pydantic v2 validation  │  │
+┌──────────────┐                   │  └──────────────────────────┘  │
+│ Streamlit UI │ ── HTTP (local) ─▶│  ┌──────────────────────────┐  │
+│  (app.py)    │  ⭐ bonus          │  │   business_logic.py      │  │
+└──────────────┘                   │  │  day decomposition       │  │
+                                   │  └──────────────────────────┘  │
+                                   │  ┌──────────────────────────┐  │
+                                   │  │   dq_engine.py  ⭐       │  │
+                                   │  │  5 domains, 16 rules     │  │
+                                   │  └──────────────────────────┘  │
+                                   │  ┌──────────────────────────┐  │
+                                   │  │  database.py /           │  │
+                                   │  │  database_sqlite.py      │  │
+                                   │  └──────────────┬───────────┘  │
+                                   └─────────────────┼──────────────┘
+                                                     │
+                          ┌──────────────────────────┴──────────────────────────┐
+                          │                                                     │
+                   ┌──────▼──────┐                                    ┌─────────▼───────┐
+                   │  SQL Server │                                    │  SQLite (PoC)   │
+                   │  LeaveDB    │  ← production                     │  data/leave.db  │
+                   │  + SP       │                                    │                 │
+                   └─────────────┘                                    └─────────────────┘
+```
+
+**Technology stack**
 
 | Layer | Technology |
 |---|---|
 | API framework | FastAPI (Python) |
 | Validation | Pydantic v2 |
-| Database | SQL Server (`pyodbc` + `usp_PersistLeaveSubmission` SP) · SQLite PoC (`sqlite3`) |
-| Testing | Pytest + FastAPI TestClient |
+| Business logic | Pure Python (`business_logic.py`, `dq_engine.py`) |
+| DB — production | SQL Server via `pyodbc` + `usp_PersistLeaveSubmission` SP |
+| DB — PoC | SQLite via `sqlite3` (stdlib) |
+| UI — PoC ⭐ | Streamlit |
+| Testing | Pytest + FastAPI TestClient (in-memory SQLite) |
 | Runtime | Uvicorn (ASGI) |
-| UI (PoC) | Streamlit |
-| DQ engine | Pure-Python (`dq_engine.py`) — 5 domains, 16 rules |
 
 ---
 
-## 3. Data Modeling Approach
+## 7. Detailed Design
 
-### 3.1 Primary pattern — OLTP 3NF (Inmon-aligned)
+### 7.1 API Specification
 
-The schema follows a normalised **header–detail (parent–child)** structure, which is the hallmark of Inmon's 3NF enterprise data model philosophy:
+**Endpoints**
 
-- `LeaveSubmission` is the **header** — one row per logical submission event, representing the single source of truth for the submission's identity, status, and date range.
-- `LeaveDay` is the **detail** — one row per working day within that submission, each independently traceable back to its parent via `SubmissionId` (FK).
-
-This separation ensures that submission-level attributes (status, approver, comments) are stored exactly once, while day-level granularity is achieved through child rows rather than wide pivoted columns or repeated header data. This aligns with Inmon's principle of capturing data at its **lowest meaningful grain** in a normalised form.
-
-> **SubmissionId design decision:** Per the assessment spec, `SubmissionId VARCHAR(50)` is the **caller-supplied** PK — the payload example provides `LS-2026-000123` directly. The implementation honours this: if `submissionId` is present in the payload it is used as-is (duplicate returns HTTP 409); if omitted, the server auto-generates `LS-YYYY-NNNNNN` from `MAX(sequence)+1` as a convenience fallback. This keeps the implementation fully spec-compliant while supporting automated clients that prefer server-generated IDs.
-
-### 3.2 Deliberate denormalisation — Kimball influence
-
-`LeaveDay` carries `WorkerId` as a **repeated column**, even though it could be derived by joining to `LeaveSubmission`. This is a conscious Kimball-style trade-off:
-
-> *"Denormalized for fast calendar queries"* — without this, any query of the form "show me all leave days for worker W in month M" would require a join to `LeaveSubmission`. With it, the query hits a single table and the covering index `IX_LeaveDay_WorkerId_Date` resolves it entirely without a lookup.
-
-In Kimball terms, `LeaveDay` behaves like a **Fact table** (grain = one working day per leave type per submission), and `WorkerId` is a degenerate dimension carried directly on the fact row. The absence of explicit `DimWorker` or `DimLeaveType` tables is intentional — those dimensions are owned by the source HRIS system and are out of scope for this API.
-
-### 3.3 Why not Star Schema or Medallion?
-
-**Star Schema** is optimised for analytical query patterns (aggregations, slicing by dimension). This schema serves an OLTP write path — the priority is transactional integrity, idempotency, and referential consistency, not dimensional drill-down. A Star Schema here would introduce unnecessary join complexity for no read-side benefit in this context.
-
-**Medallion** (Bronze → Silver → Gold) is a lakehouse-layer architecture pattern, typically implemented in Databricks or similar platforms. It is not applicable to a relational SQL Server OLTP store.
-
-### 3.4 Summary
-
-| Characteristic | Pattern applied | Evidence in schema |
+| Method | Path | Description |
 |---|---|---|
-| Header–detail normalisation | Inmon 3NF | `LeaveSubmission` → `LeaveDay` via FK |
-| Single source of truth | Inmon | `SubmissionId` as spec-defined caller-supplied PK; server auto-generates if omitted |
-| Performance denormalisation | Kimball | `WorkerId` repeated on `LeaveDay` |
-| Day-level fact grain | Kimball Fact table concept | One row per Mon–Fri day per leave type |
-| Dimensional lookups | Out of scope | No `DimWorker` / `DimLeaveType` tables |
-| Star Schema | Not applied | OLTP write path, not analytical read path |
-| Medallion | Not applicable | SQL Server OLTP, not a lakehouse |
-
----
-
-## 4. Request Flow
-
-| Step | Stage | Tag | Description |
-|------|-------|-----|-------------|
-| 1 | Parse & structural validate | Pydantic | All required fields must be present. Field types are coerced (e.g. `startDate` string → `datetime`). Missing or wrong-type fields return `HTTP 422` immediately. |
-| 2 | Date order check | model_validator | A Pydantic model validator on `LeavePeriod` asserts `startDate ≤ endDate`. Raises `HTTP 422` if violated. |
-| 3 | SubmissionId resolution | Business rule | If caller supplies `submissionId`: duplicate check → HTTP 409 on conflict. If omitted: server generates `LS-YYYY-NNNNNN` from `MAX(sequence)+1`. |
-| 4 | Working-day alignment check | Business rule | Counts actual Mon–Fri days in the range. Must equal `totalWorkingDays` AND sum of `leaveDetail.quantity`. Returns HTTP 400 on mismatch. |
-| 5 | DQ checks *(bonus)* | DQ engine | Runs 16 rules across 5 domains. **UNQ-001 (overlapping dates) is Critical → HTTP 400, nothing persisted.** All other issues are soft warnings passed through in `dq_issues`. |
-| 6 | Day decomposition | Business logic | Iterates calendar days from start → end, emitting one `LeaveDayRecord` per Mon–Fri day. Per-day quantity is always `1.00`. |
-| 7 | Atomic DB write | DB transaction | SQLite: `executemany` in a single connection. SQL Server: `usp_PersistLeaveSubmission` SP — single call, OPENJSON bulk INSERT, XACT_ABORT ON. Rolled back entirely on any error. |
-| 8 | 201 Created response | Done | Returns `submissionId`, `workerId`, `totalWorkingDaysCreated`, full `leaveDays` array, and `dq_issues` array (empty if no warnings). |
-
----
-
-## 5. Day Decomposition
-
-**Sample payload: 2 Mar – 20 Mar 2026**
-
-The 3-week period contains **15 working days** (Mon–Fri). Weekends are skipped — 6 days in total across 3 weekends.
-
-| Mon | Tue | Wed | Thu | Fri | Sat | Sun |
-|-----|-----|-----|-----|-----|-----|-----|
-| 03/02 ✓ | 03/03 ✓ | 03/04 ✓ | 03/05 ✓ | 03/06 ✓ | 03/07 — | 03/08 — |
-| 03/09 ✓ | 03/10 ✓ | 03/11 ✓ | 03/12 ✓ | 03/13 ✓ | 03/14 — | 03/15 — |
-| 03/16 ✓ | 03/17 ✓ | 03/18 ✓ | 03/19 ✓ | 03/20 ✓ | — | — |
-
-> ✓ Working day — persisted to `dbo.LeaveDay` &nbsp;|&nbsp; — Weekend, skipped
-
-Each working day produces 1 row in `dbo.LeaveDay` with `LeaveTypeCode = AL`, `Quantity = 1.00`, linked to `LS-2026-000123`.
-
-Public holidays are out of scope and are not excluded by the current implementation.
-
----
-
-## 6. Database Schema
-
-### 6.1 dbo.LeaveSubmission
-
-One row per submission. `SubmissionId` is the spec-defined `PK`. Dual-mode: caller-supplied value is used if provided; server generates `LS-YYYY-NNNNNN` from `MAX(sequence)+1` if omitted.
-
-| Column | Type | Notes |
-|--------|------|-------|
-| **SubmissionId** `PK` | `VARCHAR(50)` | Caller-supplied or server-generated `LS-YYYY-NNNNNN` |
-| WorkerId | `VARCHAR(50)` | FK-like; worker table not in scope |
-| StartDatetime | `DATETIME` | Preserves time component from payload |
-| EndDatetime | `DATETIME` | 23:59:59.99 for end-of-day semantics |
-| TotalDays | `INT` | Matches validated working-day count |
-| Status | `VARCHAR(20)` | Submitted / Approved / Rejected |
-| SubmittedDate | `DATE` | Date only, no time |
-
-### 6.2 dbo.LeaveDay
-
-One row per working day per leave type. The unique constraint on `(SubmissionId, LeaveDate, LeaveTypeCode)` prevents duplicate day entries **within the same submission** at the database level. Note: a worker may legitimately hold leave on the same date across different submissions (e.g. resubmissions after cancellation), so the constraint is scoped to `SubmissionId`, not `WorkerId`.
-
-| Column | Type | Notes |
-|--------|------|-------|
-| **LeaveDayId** `PK` | `INT IDENTITY` | Surrogate, auto-increment |
-| SubmissionId `FK` | `VARCHAR(50)` | → LeaveSubmission.SubmissionId (PK) |
-| WorkerId | `VARCHAR(50)` | Denormalized for fast calendar queries (Kimball pattern) |
-| LeaveDate | `DATE` | One Mon–Fri day per row |
-| LeaveTypeCode | `VARCHAR(10)` | AL, SL, CL … |
-| LeaveCategory | `VARCHAR(20)` | Paid / Unpaid |
-| UnitOfMeasure | `VARCHAR(10)` | Days / Hours |
-| Quantity | `DECIMAL(5,2)` | Always 1.00 per day row |
-
-**Indexes:** `IX_LeaveDay_SubmissionId` · `IX_LeaveDay_WorkerId_Date` · `UQ (SubmissionId, LeaveDate, LeaveTypeCode)`
-
-### 6.3 dbo.DQResult
-
-One row per DQ warning per submission. Written only after successful persist. Critical issues (UNQ-001) block persistence entirely — they are never written to DQResult.
-
-| Column | Type | Notes |
-|--------|------|-------|
-| **DQResultId** `PK` | `INT IDENTITY` | Surrogate, auto-increment |
-| SubmissionId `FK` | `VARCHAR(50)` | → LeaveSubmission.SubmissionId |
-| CheckedAt | `DATETIME` | ISO-8601 timestamp of check |
-| Domain | `VARCHAR(20)` | Accuracy / Completeness / Consistency / Timeliness / Uniqueness |
-| Severity | `VARCHAR(10)` | Warning (soft) · Critical = UNQ-001 only, never reaches this table |
-| Code | `VARCHAR(10)` | e.g. ACC-001 |
-| Field | `VARCHAR(100)` | Affected payload field path |
-| Message | `TEXT` | Human-readable issue description |
-
-**Indexes:** `IX_DQResult_SubmissionId` · `IX_DQResult_Domain_Severity`
-
-### 6.4 Entity relationship
-
-```mermaid
-erDiagram
-    LeaveSubmission {
-        VARCHAR50 SubmissionId PK "Caller-supplied or server-generated"
-        VARCHAR50 WorkerId "FK-like to HRIS worker"
-        DATETIME StartDatetime "Payload start incl. time"
-        DATETIME EndDatetime "23:59:59.99 end-of-day"
-        INT TotalDays "Validated working-day count"
-        VARCHAR20 Status "Submitted / Approved / Rejected"
-        DATE SubmittedDate "Date only"
-    }
-
-    LeaveDay {
-        INT LeaveDayId PK "Surrogate auto-increment"
-        VARCHAR50 SubmissionId FK "-> LeaveSubmission"
-        VARCHAR50 WorkerId "Denormalised for calendar queries"
-        DATE LeaveDate "One Mon-Fri day per row"
-        VARCHAR10 LeaveTypeCode "AL / SL / CL"
-        VARCHAR20 LeaveCategory "Paid / Unpaid"
-        VARCHAR10 UnitOfMeasure "Days / Hours"
-        DECIMAL52 Quantity "Always 1.00 per row"
-    }
-
-    LeaveSubmission ||--o{ LeaveDay : "decomposes into"
-    LeaveSubmission ||--o{ DQResult : "DQ issues"
-
-    DQResult {
-        INT DQResultId PK "Surrogate auto-increment"
-        VARCHAR50 SubmissionId FK "-> LeaveSubmission"
-        TEXT CheckedAt "ISO-8601 timestamp"
-        VARCHAR20 Domain "5 DQ domains"
-        VARCHAR10 Severity "Critical / Warning"
-        VARCHAR10 Code "e.g. ACC-001"
-        VARCHAR100 Field "Payload field path"
-        TEXT Message "Issue description"
-    }
-```
-
-> `||--o{` — `LeaveSubmission` 1건은 0개 이상의 `LeaveDay`로 분해됨. `SubmissionId`는 스펙 정의 PK이자 DB 트랜잭션 안에서 원자적으로 생성되는 `LS-YYYY-NNNNNN` 값. `WorkerId`가 양쪽 테이블에 존재하는 것이 Kimball 스타일 비정규화 포인트 (섹션 3.2 참조).
-
----
-
-## 7. HTTP Responses
-
-| Code | Status | Description |
-|------|--------|-------------|
-| `201` | Created | Submission accepted, all day rows written. Response includes `totalWorkingDaysCreated` and the full `leaveDays` array. |
-| `400` | Bad Request — business rule violation | Actual Mon–Fri count doesn't match `totalWorkingDays`, or quantity sum is inconsistent. Message describes the mismatch numerically. |
-| `409` | Conflict — concurrent race condition | Two requests generated the same sequence number simultaneously. The UI retries automatically with a refreshed ID. Not expected in normal operation. |
-| `422` | Unprocessable Entity — validation failure | Required fields missing, wrong types, or constraint violations caught by Pydantic (e.g. `startDate > endDate`, empty `leaveDetails`). |
-| `500` | Internal Server Error | Database connection failure or unexpected exception. Transaction is rolled back — no partial data is written. Safe to retry with the same payload. |
-
----
-
-## 8. File Structure
-
-| File | Production (SQL Server) | Purpose | PoC (SQLite) | Purpose |
-|---|---|---|---|---|
-| Schema / DDL | `schema.sql` | SQL Server DDL — 3 tables (`LeaveSubmission`, `LeaveDay`, `DQResult`) + indexes + `usp_PersistLeaveSubmission` SP | `poc/db_setup.py` | SQLite DDL + `create_database()` — self-healing on every connection |
-| Models | `models.py` | Pydantic v2 request / response schemas | `poc/models.py` | Same file — shared with production |
-| Business logic | `business_logic.py` | Pure-Python day decomposition, alignment validation, SubmissionId generation (no DB dependency) | `poc/business_logic.py` | Same file — shared with production |
-| DB layer | `database.py` | `pyodbc` persistence — delegates writes to `usp_PersistLeaveSubmission`; same function interface as SQLite layer | `poc/database_sqlite.py` | SQLite persistence with verbose diagnostic logging |
-| DQ engine | — | — | `poc/dq_engine.py` | 5 domains, 16 rules — UNQ-001 Critical (hard reject), all others Warning ⭐ bonus |
-| API | `main.py` | FastAPI app — POST + GET endpoints, global exception handlers | `poc/main.py` | FastAPI app — BDAXAI patterns (`lifespan`, `writelog`, `POWERHOUSE_*` env vars) |
-| UI | — | — | `poc/app.py` | Streamlit UI — Submit Leave (st.dialog DQ popup, session-state duplicate guard), Leave Balance, Browse DB, DQ Dashboard ⭐ bonus |
-| Tests | `tests/test_leave_submission.py` | Pytest suite — DB mocked; covers all HTTP status codes | `poc/tests/test.py` | Pytest suite — in-memory SQLite, no file I/O required |
-| Config | — | — | `poc/.env` | `POWERHOUSE_DB_PATH`, `POWERHOUSE_POC_SERVER_PORT`, `POWERHOUSE_DB_ENGINE`, etc. |
-
----
-
-## 9. Running Locally
-
-**SQLite PoC (default):**
-```bash
-pip install -r requirements.txt
-uvicorn main:app --port 8090 --reload
-streamlit run app.py
-pytest tests/ -v
-```
-
-**SQL Server production:**
-```bash
-# 1. Run DDL + SP (once)
-sqlcmd -S <server> -d LeaveDB -i schema.sql
-
-# 2. Set env vars
-POWERHOUSE_DB_ENGINE=sqlserver
-POWERHOUSE_MSSQL_SERVER=<server>
-POWERHOUSE_MSSQL_DATABASE=LeaveDB
-POWERHOUSE_MSSQL_UID=<user>
-POWERHOUSE_MSSQL_PWD=<password>
-
-# 3. Start
-uvicorn main:app --port 8090 --reload
-```
-
-**PoC (SQLite):**
-```bash
-cd poc
-pip install -r requirements.txt
-del data\leave.db                  # reset DB if schema changed
-uvicorn main:app --port 8090 --reload
-streamlit run app.py               # UI at http://localhost:8501
-pytest tests/ -v                   # in-memory SQLite, no DB file needed
-```
-
----
-
-## 10. Known Constraints & Future Considerations
-
-| Item | Current state | Suggested next step |
-|---|---|---|
-| Public holidays | Out of scope — not excluded from working-day count | Integrate a public holiday calendar (e.g. `holidays` Python library) into `_is_working_day()` |
-| Part-day leave | `Quantity` fixed at `1.00` per day row | Extend decomposition logic to accept fractional quantities (e.g. half-days) |
-| Multiple leave types in one period | Supported — each `leaveDetail` item produces its own set of day rows | Validate that quantities across types sum to `totalWorkingDays` |
-| Concurrency (SQLite) | SQLite serialises writes via DB-level lock — safe for PoC, bottleneck under high load | Use SQL Server `SEQUENCE` object or `NEWSEQUENTIALID()` for production concurrent writes |
-| DQ — expand Critical rules | Only UNQ-001 is Critical today; other rules are soft | Promote CON-002 (quantity mismatch) and ACC-003 (invalid leave type) to Critical as governance matures |
-| DQ — public holiday | Working-day check excludes weekends but not public holidays | Integrate `holidays` library into `_is_working_day()` |
-| Surrogate PK | `SubmissionId VARCHAR(50)` is the spec PK — VARCHAR FK joins are slower than INT | Add `Id INT IDENTITY` surrogate PK if high join volume becomes a concern |
-| Worker dimension | `WorkerId` is a bare string with no FK to a worker table | Add `dbo.Worker` reference table and enforce referential integrity |
-| Analytical reporting | Current schema is OLTP-optimised | For reporting, consider a Gold-layer view or Star Schema projection on top of these tables |
-
----
-
----
-
-# Appendix
-
-## Appendix A — Alternative Solution Comparison: Node.js + Express vs Python + FastAPI
-
-An alternative implementation using **Node.js, Express, and `mssql`** was reviewed against this solution. The two approaches share the same core logic (working-day decomposition, transactional persistence, FK structure, `Quantity = 1.00` per day), but differ in completeness and production-readiness.
-
-### A.1 Feature comparison
-
-| Item | Node.js + Express | Python + FastAPI | Assessment |
-|---|---|---|---|
-| Runtime & framework | Node.js + Express | Python + FastAPI | Functionally equivalent |
-| Input field casing | `LEAVESUBMISSION`, `WORKERID` (UPPERCASE) | `leaveSubmission`, `workerId` (camelCase) | ⚠️ Node.js deviates from the payload spec |
-| Input validation | Manual `if` checks | Pydantic v2 automatic | ⚠️ Node.js risks runtime errors on missing nested fields |
-| Duplicate submission handling | ❌ Not implemented | ✅ HTTP 409 returned | ⚠️ Node.js lets DB constraint violation surface as HTTP 500 |
-| `leaveDetail` quantity sum check | ❌ Not implemented | ✅ Validated against `totalWorkingDays` | ⚠️ Node.js skips this business rule |
-| Multiple `leaveDetails` support | ❌ Hardcoded `[0]` only | ✅ Full iteration over all items | ⚠️ Node.js silently drops all but the first leave type |
-| DB insert strategy | `await` per row in loop (N+1) | `executemany` batch | ⚠️ Node.js makes 15 round-trips for a 15-day submission |
-| Index definitions in DDL | ❌ None | ✅ 2 indexes + UQ constraint | ⚠️ Node.js calendar queries will be slower without indexes |
-| HTTP status code granularity | `400` for all errors | `400` / `409` / `422` / `500` distinct | ⚠️ Node.js is less RESTful — clients cannot distinguish error types |
-| Test coverage | ❌ None | ✅ Pytest suite, DB mocked | ⚠️ Node.js behaviour cannot be verified without a live DB |
-
-### A.2 Key risks in the Node.js + Express solution
-
-**Risk 1 — Duplicate submission surfaces as HTTP 500.**
-Without an explicit idempotency check, a repeated `SubmissionId` hits the DB `PRIMARY KEY` constraint and returns a generic `500 Internal Server Error`. The caller cannot distinguish a server fault from a duplicate submission, making safe retry logic impossible.
-
-**Risk 2 — `leaveDetails[0]` hardcoding.**
-The comment in the source acknowledges this: `// Assuming single type for simplicity`. In production, any payload with multiple leave types would silently persist only the first type's days — a data integrity failure with no error raised.
-
-**Risk 3 — N+1 insert pattern.**
-Inserting each `LeaveDay` row in a sequential `await` loop means 15 database round-trips for a 15-day submission, 65 for a quarter, and so on. The `executemany` batch approach in Python + FastAPI reduces that to a single network call.
-
-### A.3 Verdict
-
-The Node.js + Express solution is a **functional prototype** that demonstrates the correct conceptual approach. It would work correctly for the happy-path case in a controlled demo. Python + FastAPI targets **production readiness** — covering idempotency, multi-type leave, batch persistence, index-backed queries, and a full test suite.
-
----
-
-## Appendix B — Streamlit UI (PoC) ⭐ Bonus
-
-A three-page Streamlit application (`poc/app.py`) provides a human-friendly interface over the SQLite PoC.
-
-### B.1 Pages
-
-| Page | Description |
-|---|---|
-| **Submit Leave** | Form-based leave submission. `SubmissionId` is read-only — auto-calculated from `MAX(sequence)+1` queried from the DB on page load. Date pickers are outside `st.form` to trigger live reruns; working-day count and `Quantity` update instantly as dates change. |
-| **Leave Balance** | Worker filter, KPI cards (total days, worker count, leave types), bar chart, and summary table — all sourced directly from SQLite. |
-| **Browse DB** | `LeaveSubmission` and `LeaveDay` tabs with multi-select filters. Drill-down: selecting a `SubmissionId` shows its day rows inline. DB stats footer (row counts, file size). |
-
-### B.2 SubmissionId concurrency in the UI
-
-The UI reads `MAX(sequence)` from the DB to pre-fill the read-only Submission ID field. This is a best-effort display only — the actual ID is generated atomically server-side inside the DB transaction. If two users submit simultaneously and the UI shows the same ID to both:
-
-1. One request succeeds.
-2. The other receives `HTTP 409` (duplicate `submissionId` already committed).
-3. The UI auto-retries once with `next_submission_id()` — transparent to the user.
-
-### B.3 Running
-
-```bash
-cd poc
-# Terminal 1 — API
-uvicorn main:app --port 8090 --reload
-
-# Terminal 2 — UI
-streamlit run app.py
-```
----
-
-## Appendix C — API Specification
-
-### C.1 POST /api/v1/leave-submissions
-
-**Summary:** Submit a worker leave request.
-`submissionId` is server-generated (LS-YYYY-NNNNNN) — the field may be present in the payload but is ignored; the server atomically generates the ID inside the DB transaction.
-
-#### Request body — `application/json`
+| `POST` | `/api/v1/leave-submissions` | Submit a leave request |
+| `GET` | `/api/v1/leave-submissions/{submission_id}` | Retrieve submission + day records |
+| `GET` | `/health` | Liveness check |
+
+**POST — Request body (`application/json`)**
 
 ```json
 {
@@ -399,15 +223,426 @@ streamlit run app.py
 }
 ```
 
-#### Responses
+> `submissionId` is optional — if omitted the server generates `LS-YYYY-NNNNNN` from `MAX(sequence)+1`.
 
-| Code | Description | Schema |
-|------|-------------|--------|
-| `201` | Submission created successfully | `LeaveSubmissionResponse` |
-| `400` | Business rule violation or DQ Critical rejection (UNQ-001) | `ErrorResponse` |
-| `409` | Duplicate `submissionId` — caller-supplied ID already exists | `ErrorResponse` |
-| `422` | Request validation failed | `ErrorResponse` |
-| `500` | Internal server error | `ErrorResponse` |
+**POST — HTTP status codes**
+
+| Code | Scenario | Description |
+|---|---|---|
+| `201` | Success | Submission created; all day rows written |
+| `400` | Business rule violation | Working-day mismatch, quantity error, or UNQ-001 DQ rejection |
+| `409` | Duplicate | Caller-supplied `submissionId` already exists |
+| `422` | Validation failure | Missing fields, wrong types, or `startDate > endDate` |
+| `500` | Server error | DB failure — transaction rolled back, no partial data written |
+
+**GET — Path parameter**
+
+| Name | In | Type | Required | Example |
+|---|---|---|---|---|
+| `submission_id` | path | string | ✅ | `LS-2026-000007` |
+
+**GET — HTTP status codes**
+
+| Code | Scenario |
+|---|---|
+| `200` | Submission found — returns header + day records |
+| `404` | `submissionId` not found |
+
+---
+
+### 7.2 Business Logic
+
+**Processing flow**
+
+| Step | Stage | Description |
+|---|---|---|
+| 1 | Parse & validate | Pydantic v2 validates all required fields and types. Returns HTTP 422 on failure. |
+| 2 | Date order check | `startDate ≤ endDate` asserted by Pydantic `model_validator`. Returns HTTP 422 if violated. |
+| 3 | SubmissionId resolution | If caller supplies `submissionId`: duplicate check → HTTP 409. If omitted: server generates `LS-YYYY-NNNNNN`. |
+| 4 | Alignment check | Actual Mon–Fri count must equal `totalWorkingDays` AND sum of `leaveDetail.quantity`. Returns HTTP 400 on mismatch. |
+| 5 | DQ checks ⭐ | 16 rules across 5 domains. UNQ-001 (overlap) → HTTP 400, nothing persisted. All other issues are soft warnings. |
+| 6 | Day decomposition | Iterates `startDate → endDate`, emitting one `LeaveDayRecord` per Mon–Fri day at `Quantity = 1.00`. |
+| 7 | Atomic DB write | Header + day rows written in a single transaction. Rolled back entirely on any error. |
+| 8 | 201 response | Returns `submissionId`, `workerId`, `totalWorkingDaysCreated`, `leaveDays`, `dq_issues`. |
+
+**Working-day decomposition example (2 Mar – 20 Mar 2026 → 15 days)**
+
+| Mon | Tue | Wed | Thu | Fri | Sat | Sun |
+|-----|-----|-----|-----|-----|-----|-----|
+| 03/02 ✓ | 03/03 ✓ | 03/04 ✓ | 03/05 ✓ | 03/06 ✓ | 03/07 — | 03/08 — |
+| 03/09 ✓ | 03/10 ✓ | 03/11 ✓ | 03/12 ✓ | 03/13 ✓ | 03/14 — | 03/15 — |
+| 03/16 ✓ | 03/17 ✓ | 03/18 ✓ | 03/19 ✓ | 03/20 ✓ | — | — |
+
+> ✓ persisted to `dbo.LeaveDay` · — weekend, skipped
+
+---
+
+### 7.3 Data Model
+
+**Design approach**
+
+The schema follows a normalised header–detail (Inmon 3NF) structure. `WorkerId` is deliberately denormalised on `LeaveDay` (Kimball pattern) to enable fast calendar queries without joining to the header table.
+
+**Entity: dbo.LeaveSubmission** — one row per submission
+
+| Column | Type | Notes |
+|---|---|---|
+| **SubmissionId** `PK` | `VARCHAR(50)` | Caller-supplied or server-generated `LS-YYYY-NNNNNN` |
+| WorkerId | `VARCHAR(50)` | HRIS external reference |
+| StartDatetime | `DATETIME` | Preserves time component from payload |
+| EndDatetime | `DATETIME` | 23:59:59.99 end-of-day semantics |
+| TotalDays | `INT` | Validated working-day count |
+| Status | `VARCHAR(20)` | Submitted / Draft / Pending |
+| SubmittedDate | `DATE` | Date only, no time |
+
+**Entity: dbo.LeaveDay** — one row per Mon–Fri working day
+
+| Column | Type | Notes |
+|---|---|---|
+| **LeaveDayId** `PK` | `INT IDENTITY` | Surrogate, auto-increment |
+| SubmissionId `FK` | `VARCHAR(50)` | → LeaveSubmission.SubmissionId |
+| WorkerId | `VARCHAR(50)` | Denormalised for fast calendar queries |
+| LeaveDate | `DATE` | One Mon–Fri day per row |
+| LeaveTypeCode | `VARCHAR(10)` | AL / SL / CL / UL / PL / LWP |
+| LeaveCategory | `VARCHAR(20)` | Paid / Unpaid |
+| UnitOfMeasure | `VARCHAR(10)` | Days / Hours |
+| Quantity | `DECIMAL(5,2)` | Always 1.00 per day row |
+
+**Indexes & constraints:** `UQ (SubmissionId, LeaveDate, LeaveTypeCode)` · `IX_LeaveDay_SubmissionId` · `IX_LeaveDay_WorkerId_Date`
+
+**Entity: dbo.DQResult** ⭐ — one row per DQ warning per submission
+
+| Column | Type | Notes |
+|---|---|---|
+| **DQResultId** `PK` | `INT IDENTITY` | Surrogate, auto-increment |
+| SubmissionId `FK` | `VARCHAR(50)` | → LeaveSubmission.SubmissionId |
+| CheckedAt | `DATETIME` | ISO-8601 timestamp |
+| Domain | `VARCHAR(20)` | Accuracy / Completeness / Consistency / Timeliness / Uniqueness |
+| Severity | `VARCHAR(10)` | Warning only — Critical issues never reach this table |
+| Code | `VARCHAR(10)` | e.g. ACC-001 |
+| Field | `VARCHAR(100)` | Affected payload field path |
+| Message | `TEXT` | Human-readable description |
+
+**Entity relationship**
+
+```mermaid
+erDiagram
+    LeaveSubmission {
+        VARCHAR50 SubmissionId PK
+        VARCHAR50 WorkerId
+        DATETIME StartDatetime
+        DATETIME EndDatetime
+        INT TotalDays
+        VARCHAR20 Status
+        DATE SubmittedDate
+    }
+    LeaveDay {
+        INT LeaveDayId PK
+        VARCHAR50 SubmissionId FK
+        VARCHAR50 WorkerId
+        DATE LeaveDate
+        VARCHAR10 LeaveTypeCode
+        VARCHAR20 LeaveCategory
+        VARCHAR10 UnitOfMeasure
+        DECIMAL52 Quantity
+    }
+    DQResult {
+        INT DQResultId PK
+        VARCHAR50 SubmissionId FK
+        TEXT CheckedAt
+        VARCHAR20 Domain
+        VARCHAR10 Severity
+        VARCHAR10 Code
+        TEXT Message
+    }
+    LeaveSubmission ||--o{ LeaveDay : "decomposes into"
+    LeaveSubmission ||--o{ DQResult : "DQ warnings"
+```
+
+---
+
+### 7.4 Data Flow
+
+```
+JSON Payload (POST)
+        │
+        ▼
+┌───────────────────┐
+│  Pydantic v2      │  ← structural validation (HTTP 422 on fail)
+│  validation       │
+└────────┬──────────┘
+         │
+         ▼
+┌───────────────────┐
+│  SubmissionId     │  ← duplicate check (HTTP 409) or generate LS-YYYY-NNNNNN
+│  resolution       │
+└────────┬──────────┘
+         │
+         ▼
+┌───────────────────┐
+│  Alignment check  │  ← Mon–Fri count vs totalWorkingDays (HTTP 400 on fail)
+└────────┬──────────┘
+         │
+         ▼
+┌───────────────────┐
+│  DQ engine  ⭐    │  ← 16 rules; UNQ-001 Critical → HTTP 400; others → warnings
+└────────┬──────────┘
+         │
+         ▼
+┌───────────────────┐
+│  Day decomposition│  ← expand period → [LeaveDayRecord, ...]
+└────────┬──────────┘
+         │
+         ▼
+┌───────────────────┐   SQL Server: usp_PersistLeaveSubmission (single SP call)
+│  Atomic DB write  │   SQLite PoC: executemany in single connection/transaction
+└────────┬──────────┘
+         │
+         ▼
+    HTTP 201 Created
+    { submissionId, leaveDays, dq_issues }
+```
+
+---
+
+## 8. Integration Design
+
+| System | Interface | Protocol | Direction | Notes |
+|---|---|---|---|---|
+| HRIS | Worker master data | REST (read-only) | Inbound reference | `WorkerId` validated by pattern only in PoC; FK to worker table out of scope |
+| Payroll | Leave export | Batch / API | Outbound | Downstream consumer of `dbo.LeaveDay` day-level records |
+| Event bus (future) | Submission events | Kafka / Service Bus | Outbound | Publish `LeaveSubmitted` event on 201 — enables downstream consumers (Payroll, DAMS, notifications) to subscribe without polling |
+| Streamlit UI ⭐ | HTTP REST | HTTP (localhost) | Inbound | Calls `POST /api/v1/leave-submissions` and reads SQLite directly for balance/admin pages |
+
+> No live integration is implemented in this PoC. `WorkerId` is accepted as a bare string; HRIS and Payroll are identified as future integration targets.
+
+> **Museum / DAMS applicability note:** The same header-detail pattern, DQ engine, and metadata governance model applied here translates directly to collection asset ingestion workflows — replacing `LeaveSubmission` with a collection item record and `LeaveDay` with asset-level provenance or digitisation event rows. The DQ domain rules (Accuracy, Completeness, Consistency) map cleanly to collection metadata standards (e.g. Dublin Core, Spectrum).
+
+---
+
+## 9. Security Design
+
+| Control | Current (PoC) | Production target |
+|---|---|---|
+| Authentication | None | OAuth2 / JWT bearer token |
+| Authorisation | None | RBAC — workers can submit own leave; managers can view all |
+| Transport security | HTTP (localhost only) | TLS 1.2+ mandatory |
+| Input sanitisation | Pydantic v2 strict type coercion | Same — no raw SQL from user input |
+| SQL injection | N/A — parameterised queries throughout (`?` placeholders) | Same |
+| Secrets management | `.env` file (local) | Azure Key Vault / AWS Secrets Manager |
+| Data masking | Not implemented | Mask `WorkerId` and `approverId` in logs |
+| Audit trail | Full day-level records in `LeaveDay` + DQ log in `DQResult` | Same + immutable audit log table |
+
+---
+
+## 10. Error Handling Strategy
+
+| Scenario | HTTP Code | Handling |
+|---|---|---|
+| Missing / wrong-type field | 422 | Pydantic raises `ValidationError` → FastAPI returns 422 with field-level detail |
+| `startDate > endDate` | 422 | Pydantic `model_validator` raises `ValueError` |
+| Working-day mismatch | 400 | `validate_working_day_alignment()` raises `ValueError` → caught in endpoint |
+| DQ Critical (UNQ-001 overlap) | 400 | `run_dq_checks()` returns `passed=False` → HTTP 400 with `dq_issues` array |
+| Duplicate `submissionId` | 409 | `submission_exists()` checked before write; SQL Server SP also raises `THROW 50409` |
+| DB connection failure | 500 | `get_connection()` context manager catches exception → rollback → HTTP 500 |
+| Partial write | 500 | `XACT_ABORT ON` (SQL Server) / explicit `rollback()` (SQLite) — no partial data persisted |
+
+All error responses follow `ErrorResponse` schema:
+```json
+{ "error": "string", "detail": "string" }
+```
+
+---
+
+## 11. Logging & Monitoring
+
+**Logging implementation**
+
+- Framework: Python `logging` module — mirrors BDAXAI `setup_logger` / `writelog` pattern
+- Format: `YYYY-MM-DD HH:MM:SS | LEVEL    | [MODULE.function] message`
+- Outputs: file (`logs/main-YYYYMMDD.log`) + stdout (console)
+- Log path: anchored to `__file__` directory — independent of working directory
+
+**Log levels**
+
+| Level | Usage |
+|---|---|
+| INFO | Request received, steps completed, DB operations |
+| WARNING | DQ warnings, backdated submissions, path mismatches |
+| ERROR | DB exceptions, rollbacks, unexpected failures |
+
+**Key log points per request**
+
+```
+[LEAVE_POC.submit_leave] Received request workerId=W123456
+[DB.submission_exists] Checking submissionId=LS-2026-000007
+[LEAVE_POC.submit_leave] DQ WARNING — 2 issue(s): ['ACC-001', 'TML-001']
+[DB.persist_submission] Inserting LeaveSubmission header
+[DB.persist_submission] Inserting 15 LeaveDay rows
+[DB.persist_submission] ✅ LeaveDay rows inserted
+[LEAVE_POC.submit_leave] ✅ Persisted submissionId=LS-2026-000007
+```
+
+**Monitoring (production targets)**
+
+| Metric | Description |
+|---|---|
+| Request count | Total POST/GET requests per minute |
+| Latency (p95) | 95th percentile API response time |
+| Failure rate | 4xx / 5xx responses as % of total |
+| DQ issue rate | % of submissions with at least one DQ warning |
+| UNQ-001 rejection rate | % of submissions rejected for overlap |
+
+---
+
+## 12. Deployment Architecture
+
+**PoC (local)**
+
+```
+Developer machine
+  ├── uvicorn main:app --port 8090   ← FastAPI
+  ├── streamlit run app.py           ← Streamlit UI (optional)
+  └── data/leave.db                  ← SQLite file (auto-created)
+```
+
+**Production target**
+
+```
+[CI/CD Pipeline]
+  Build → Unit tests → Integration tests → Docker image → Push to registry
+                                                               │
+                                                               ▼
+                                                    [Kubernetes / App Service]
+                                                      FastAPI container (n replicas)
+                                                               │
+                                                               ▼
+                                                         [SQL Server]
+                                                           LeaveDB
+```
+
+**Environment promotion**
+
+| Stage | DB | Notes |
+|---|---|---|
+| DEV | SQLite (PoC) | Local development, no infrastructure required |
+| SIT | SQL Server (shared) | Integration testing with HRIS stubs |
+| UAT | SQL Server (isolated) | Business acceptance testing |
+| PROD | SQL Server (HA) | Always-on availability group recommended |
+
+**CI/CD**
+
+- Build: `pip install -r requirements.txt`
+- Test: `pytest tests/ -v` (in-memory SQLite, no DB connection required)
+- Deploy: Docker image → container registry → rolling deploy
+
+---
+
+## 13. Testing Strategy
+
+| Type | Scope | Tool | Notes |
+|---|---|---|---|
+| Unit | `business_logic.py` — `generate_submission_id`, `working_days_in_range`, `validate_working_day_alignment` | Pytest | Pure Python, no DB dependency |
+| Unit | `dq_engine.py` — all 16 rules | Pytest | Injected `existing_dates_fn` mock |
+| Integration | POST endpoint — all HTTP status codes (201, 400, 409, 422) | Pytest + FastAPI TestClient | In-memory SQLite, monkeypatched `get_connection` |
+| Integration | GET endpoint — 200, 404 | Pytest + FastAPI TestClient | Uses server-generated ID from POST response |
+| Integration | Dual-mode SubmissionId — caller-supplied + server-generated | Pytest | Both paths validated |
+| Integration | UNQ-001 hard reject | Pytest | Submit same dates twice; second must return 400 |
+| Manual | Streamlit UI — Submit, Balance, Browse DB, DQ Dashboard | Browser | Verified against SQLite PoC |
+
+**Test coverage highlights**
+
+- `test_caller_supplied_id_is_used` — spec compliance
+- `test_duplicate_caller_supplied_id_returns_409` — idempotency
+- `test_leave_days_count_in_response` — day decomposition correctness
+- `test_get_caller_supplied_id_returns_200` — GET endpoint round-trip
+
+---
+
+## 14. Risks & Mitigations
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Incorrect working-day count | Low | High | Unit tests for `working_days_in_range`; alignment check before persist |
+| Duplicate submission | Medium | High | `submission_exists()` pre-check + `UQ` constraint + SP `THROW 50409` |
+| Overlapping leave dates | Medium | High | UNQ-001 DQ rule (Critical) — hard reject before any write |
+| Partial DB write on failure | Low | High | `XACT_ABORT ON` (SQL Server) / `rollback()` (SQLite) — atomic or nothing |
+| Concurrent race on `submissionId` | Low | Medium | `WITH (UPDLOCK, HOLDLOCK)` in SP; UI auto-retry on 409 |
+| SQLite path mismatch (PoC) | Medium | Medium | Both processes resolve DB path relative to `__file__` — absolute path shown in UI sidebar |
+| Log path outside `poc/` directory | Low | Low | `LOG_DATAPATH` resolved relative to `__file__`, not CWD |
+
+---
+
+## 15. Future Enhancements
+
+| Item | Current state | Suggested next step |
+|---|---|---|
+| Public holidays | Not excluded from working-day count | Integrate `holidays` Python library into `_is_working_day()` |
+| Part-day leave | `Quantity` fixed at `1.00` per row | Extend decomposition to accept fractional quantities |
+| Authentication | None | OAuth2 / JWT bearer token via FastAPI middleware |
+| DQ — expand Critical rules | Only UNQ-001 is Critical | Promote CON-002 (quantity mismatch) and ACC-003 (invalid type) |
+| Approval workflow | Status field only — no workflow engine | Event-driven approval via message queue |
+| Surrogate PK | `SubmissionId VARCHAR(50)` as PK — slower FK joins | Add `Id INT IDENTITY` surrogate PK for high-volume join scenarios |
+| Worker dimension | `WorkerId` bare string, no FK | Add `dbo.Worker` reference table + referential integrity |
+| Analytical reporting / Power BI | OLTP schema only | Add a Gold-layer view (`vw_LeaveDay_Gold`) as a Star Schema projection over `dbo.LeaveDay` — directly connectable to Power BI as a semantic layer without schema changes |
+| HRIS integration | `WorkerId` accepted as-is | Live validation against HRIS worker API |
+
+---
+
+# Appendix
+
+## Appendix A — Alternative Solution Comparison: Node.js + Express vs Python + FastAPI
+
+An alternative implementation using Node.js, Express, and `mssql` was reviewed against this solution.
+
+### A.1 Feature comparison
+
+| Item | Node.js + Express | Python + FastAPI | Assessment |
+|---|---|---|---|
+| Runtime & framework | Node.js + Express | Python + FastAPI | Functionally equivalent |
+| Input field casing | `LEAVESUBMISSION`, `WORKERID` (UPPERCASE) | `leaveSubmission`, `workerId` (camelCase) | ⚠️ Node.js deviates from the payload spec |
+| Input validation | Manual `if` checks | Pydantic v2 automatic | ⚠️ Node.js risks runtime errors on missing nested fields |
+| Duplicate submission handling | ❌ Not implemented | ✅ HTTP 409 returned | ⚠️ Node.js lets DB constraint violation surface as HTTP 500 |
+| `leaveDetail` quantity sum check | ❌ Not implemented | ✅ Validated against `totalWorkingDays` | ⚠️ Node.js skips this business rule |
+| Multiple `leaveDetails` support | ❌ Hardcoded `[0]` only | ✅ Full iteration over all items | ⚠️ Node.js silently drops all but the first leave type |
+| DB insert strategy | `await` per row in loop (N+1) | `executemany` batch | ⚠️ Node.js makes 15 round-trips for a 15-day submission |
+| Index definitions in DDL | ❌ None | ✅ 2 indexes + UQ constraint | ⚠️ Node.js calendar queries will be slower without indexes |
+| HTTP status code granularity | `400` for all errors | `400` / `409` / `422` / `500` distinct | ⚠️ Node.js is less RESTful |
+| Test coverage | ❌ None | ✅ Pytest suite, DB mocked | ⚠️ Node.js behaviour cannot be verified without a live DB |
+
+### A.2 Verdict
+
+The Node.js solution is a functional prototype for the happy-path case. Python + FastAPI targets production readiness — covering idempotency, multi-type leave, batch persistence, index-backed queries, DQ engine, and a full test suite.
+
+---
+
+## Appendix B — Streamlit UI (PoC) ⭐ Bonus
+
+### B.1 Pages
+
+| Page | Description |
+|---|---|
+| 📝 Submit Leave | Form-based submission. `SubmissionId` read-only (DB `MAX+1`). Date pickers outside `st.form` for live working-day recount. `st.dialog` popup for DQ warnings (≥ Streamlit 1.36); `st.toast + st.expander` fallback. Session-state guard disables Submit after successful submission for the same date range. |
+| 📊 Leave Balance | Worker filter, KPI cards (total days, workers, leave types), bar chart, summary table — sourced directly from SQLite. |
+| 🗄️ Browse DB | `LeaveSubmission` / `LeaveDay` tabs with multi-select filters. Drill-down: select `SubmissionId` → show day rows. DB stats footer. |
+| 🔍 DQ Dashboard | Report tab (KPI cards, issues by domain/code, filtered log) + Rules tab (16-rule catalogue with domain colour coding, reference values). |
+
+### B.2 Running
+
+```bash
+cd poc
+# Terminal 1 — API
+uvicorn main:app --port 8090 --reload
+
+# Terminal 2 — UI
+streamlit run app.py
+```
+
+---
+
+## Appendix C — API Specification
+
+### C.1 POST /api/v1/leave-submissions — full response schemas
 
 **`LeaveSubmissionResponse` (201):**
 ```json
@@ -439,40 +674,12 @@ streamlit run app.py
 
 **`ErrorResponse` (400 / 409 / 422 / 500):**
 ```json
-{
-  "error": "string",
-  "detail": "string"
-}
+{ "error": "string", "detail": "string" }
 ```
 
-> **Note:** `quantity` is serialised as `float` (not `Decimal`) to avoid OpenAPI schema artifacts.
-
----
+> `quantity` is serialised as `float` (not `Decimal`) to avoid OpenAPI schema artifacts.
 
 ### C.2 GET /api/v1/leave-submissions/{submission_id}
-
-**Summary:** Retrieve a submission header and all its day records.
-
-#### Parameters
-
-| Name | In | Type | Required | Description |
-|---|---|---|---|---|
-| `submission_id` | path | string | ✅ | e.g. `LS-2026-000007` |
-
-#### Example request
-
-```bash
-curl -X GET 'http://localhost:8090/api/v1/leave-submissions/LS-2026-000007' \
-  -H 'accept: application/json'
-```
-
-#### Responses
-
-| Code | Description | Schema |
-|------|-------------|--------|
-| `200` | Submission found | `GetSubmissionResponse` |
-| `404` | Submission not found | `ErrorResponse` |
-| `422` | Validation error | FastAPI default |
 
 **`GetSubmissionResponse` (200):**
 ```json
@@ -501,23 +708,16 @@ curl -X GET 'http://localhost:8090/api/v1/leave-submissions/LS-2026-000007' \
 }
 ```
 
-**`ErrorResponse` (404):**
-```json
-{
-  "detail": "Submission 'LS-2026-000007' not found."
-}
-```
 ---
 
 ## Appendix D — Data Quality Engine ⭐ Bonus
 
 ### D.1 Design principles
 
-- **5 domains** — Accuracy, Completeness, Consistency, Timeliness, Uniqueness (per DQ-basics framework)
-- **Severity-based routing** — Warning (soft, always persists) and Critical (hard reject, HTTP 400, nothing saved)
-- **UNQ-001 is the only Critical rule** — overlapping leave dates for the same worker are a data integrity violation
-- **Separation of concerns** — `dq_engine.py` is pure Python with no DB dependency; testable in isolation
-- **Extensible** — add rules by appending to the relevant `_check_*` function
+- 5 domains: Accuracy, Completeness, Consistency, Timeliness, Uniqueness
+- Severity-based routing: Warning (soft — submission proceeds) · Critical (hard reject — HTTP 400)
+- UNQ-001 is the only Critical rule — overlapping leave dates are a data integrity violation
+- Pure Python, no DB dependency — fully unit-testable in isolation
 
 ### D.2 Rule catalogue
 
@@ -532,53 +732,19 @@ curl -X GET 'http://localhost:8090/api/v1/leave-submissions/LS-2026-000007' \
 | CMP-001 | Completeness | Warning | `approver.approverId` | Required for non-Draft submissions |
 | CMP-002 | Completeness | Warning | `comments` | Recommended for Pending status |
 | CMP-003 | Completeness | Warning | `worker.employeeNumber` | Must not be blank |
-| CON-001 | Consistency | Warning | `leavePeriod.totalWeeks` | Must be within ±1 of calculated weeks from date range |
-| CON-002 | Consistency | Warning | `leaveDetails[*].quantity` | Sum of quantity (Days UOM) must equal `totalWorkingDays` |
+| CON-001 | Consistency | Warning | `leavePeriod.totalWeeks` | Must be within ±1 of calculated weeks |
+| CON-002 | Consistency | Warning | `leaveDetails[*].quantity` | Sum (Days UOM) must equal `totalWorkingDays` |
 | CON-003 | Consistency | Warning | `submittedDate` | Must not be after `leavePeriod.startDate` |
 | TML-001 | Timeliness | Warning | `leavePeriod.startDate` | `startDate` > 30 days in the past |
 | TML-002 | Timeliness | Warning | `leavePeriod.startDate` | `startDate` > 365 days in the future |
 | TML-003 | Timeliness | Warning | `submittedDate` | Must not be a future date |
-| UNQ-001 | Uniqueness | **Critical** | `leavePeriod` | Overlapping leave dates for the same `workerId` — HTTP 400, not saved |
+| UNQ-001 | Uniqueness | **Critical** | `leavePeriod` | Overlapping leave dates for same `workerId` — HTTP 400, nothing saved |
 
-### D.3 Execution flow
-
-```
-POST payload received
-  → run_dq_checks(payload, existing_dates_fn)
-      → _check_accuracy()
-      → _check_completeness()
-      → _check_consistency()
-      → _check_timeliness()
-      → _check_uniqueness()   ← queries LeaveDay for existing dates
-  → DQResult(issues=[...], passed=bool)
-  → if not passed (UNQ-001 Critical): raise HTTP 400 — nothing persisted
-  → DB persist (submission + leave days)
-  → persist_dq_results(final_id, warning_issues)  ← warnings only to DQResult
-  → 201 response with dq_issues (warnings only)
-```
-
-### D.4 Streamlit DQ Dashboard
-
-Two tabs in the **🔍 DQ Dashboard** page:
-
-**📋 Report tab**
-- KPI cards: total issues, critical count, warning count, affected submissions
-- Issues by domain and by code (aggregated)
-- Filtered issue log with severity colour coding
-
-**📖 Rules tab**
-- Full rule catalogue table (Code, Domain, Severity, Field, Rule, Logic) with domain colour coding
-- Domain filter (multiselect)
-- Reference values: leave type codes, category/UOM allowed values, timeliness thresholds
 ---
 
 ## Appendix E — SQL Server Production Layer
 
-### E.1 Overview
-
-`database.py` is the SQL Server counterpart to `database_sqlite.py`. Both modules expose **identical function signatures** — switching between them requires only one env var change in `main.py`.
-
-### E.2 Function interface (shared by both layers)
+### E.1 Function interface (shared by SQLite + SQL Server layers)
 
 | Function | Purpose |
 |---|---|
@@ -589,65 +755,56 @@ Two tabs in the **🔍 DQ Dashboard** page:
 | `get_existing_leave_dates(worker_id)` | UNQ-001 overlap check |
 | `fetch_submission(id)` | GET endpoint query |
 
-### E.3 usp_PersistLeaveSubmission
-
-The SQL Server layer delegates the core write to a stored procedure, replacing the two separate Python calls (`persist_submission` + `persist_dq_results`) with a single SP call.
-
-```sql
-EXEC dbo.usp_PersistLeaveSubmission
-    @SubmissionId  = 'LS-2026-000007',
-    @WorkerId      = 'W123456',
-    @StartDatetime = '2026-03-02',
-    @EndDatetime   = '2026-03-20',
-    @TotalDays     = 15,
-    @Status        = 'Submitted',
-    @SubmittedDate = '2026-02-15',
-    @LeaveDaysJson = '[{"leaveDate":"2026-03-02","leaveTypeCode":"AL",...}]',
-    @DQIssuesJson  = '[{"domain":"Accuracy","severity":"Warning",...}]',
-    @FinalId       = @FinalId OUTPUT;
-```
-
-**Key SP design decisions:**
+### E.2 usp_PersistLeaveSubmission — key design decisions
 
 | Decision | Implementation |
 |---|---|
 | Atomic transaction | `SET XACT_ABORT ON` — any error auto-rolls back everything |
-| Duplicate guard | `WITH (UPDLOCK, HOLDLOCK)` — prevents concurrent race on same `SubmissionId` |
-| Bulk day INSERT | `OPENJSON(@LeaveDaysJson)` + set-based INSERT — replaces Python `executemany` loop |
-| DQ issue INSERT | `OPENJSON(@DQIssuesJson)` — single call, no separate round-trip |
+| Duplicate guard | `WITH (UPDLOCK, HOLDLOCK)` — prevents concurrent race |
+| Bulk day INSERT | `OPENJSON(@LeaveDaysJson)` set-based INSERT |
+| DQ issue INSERT | `OPENJSON(@DQIssuesJson)` — same transaction |
 | Error signalling | `THROW 50409` — caught by Python caller as HTTP 409 |
 
-**Performance comparison vs SQLite PoC:**
-
-| | SQLite PoC | SQL Server SP |
-|---|---|---|
-| Day rows insert | Python `executemany` (1 batch) | `OPENJSON` set-based (1 SQL statement) |
-| DQ issues insert | Separate `get_connection()` call | Included in SP — same transaction |
-| Network round-trips | 2 (persist + DQ) | 1 (single SP call) |
-| Atomicity | SQLite write lock | `XACT_ABORT ON` + `UPDLOCK, HOLDLOCK` |
-
-### E.4 Switching environments
-
-```python
-# main.py — single import switch, no other changes
-if os.environ.get("POWERHOUSE_DB_ENGINE") == "sqlserver":
-    from database import (get_next_sequence, submission_exists,
-                          persist_submission, persist_dq_results,
-                          get_existing_leave_dates, fetch_submission)
-else:
-    from database_sqlite import (get_next_sequence, submission_exists,
-                                 persist_submission, persist_dq_results,
-                                 get_existing_leave_dates, fetch_submission)
-```
-
-### E.5 SQL Server env vars
+### E.3 Environment variables
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `POWERHOUSE_DB_ENGINE` | `sqlite` | Set to `sqlserver` to activate `database.py` |
-| `POWERHOUSE_MSSQL_CONN` | — | Full ODBC connection string (overrides below) |
+| `POWERHOUSE_MSSQL_CONN` | — | Full ODBC connection string |
 | `POWERHOUSE_MSSQL_SERVER` | `localhost` | SQL Server host |
 | `POWERHOUSE_MSSQL_DATABASE` | `LeaveDB` | Target database |
-| `POWERHOUSE_MSSQL_UID` | — | SQL auth username (omit for Windows auth) |
+| `POWERHOUSE_MSSQL_UID` | — | SQL auth username |
 | `POWERHOUSE_MSSQL_PWD` | — | SQL auth password |
-| `POWERHOUSE_MSSQL_DRIVER` | `ODBC Driver 18 for SQL Server` | ODBC driver name |
+
+---
+
+## Appendix F — File Structure
+
+| File | Production (SQL Server) | Purpose | PoC (SQLite) | Purpose |
+|---|---|---|---|---|
+| Schema / DDL | `schema.sql` | SQL Server DDL + `usp_PersistLeaveSubmission` SP | `poc/db_setup.py` | SQLite DDL, self-healing |
+| Models | `models.py` | Pydantic v2 schemas | `poc/models.py` | Shared with production |
+| Business logic | `business_logic.py` | Day decomposition, validation | `poc/business_logic.py` | Shared with production |
+| DB layer | `database.py` | `pyodbc` + SP call | `poc/database_sqlite.py` | SQLite with verbose logging |
+| DQ engine | — | — | `poc/dq_engine.py` | 5 domains, 16 rules ⭐ |
+| API | `main.py` | FastAPI POST + GET | `poc/main.py` | BDAXAI patterns |
+| UI | — | — | `poc/app.py` | Streamlit 4-page UI ⭐ |
+| Tests | `tests/test_leave_submission.py` | Pytest, DB mocked | `poc/tests/test.py` | In-memory SQLite |
+| Config | — | — | `poc/.env` | POWERHOUSE_* env vars |
+
+---
+
+## Appendix G — Glossary
+
+| Term | Meaning |
+|---|---|
+| UOM | Unit of Measure (Days / Hours) |
+| AL / SL / CL | Annual Leave / Sick Leave / Casual Leave |
+| UL / PL / LWP | Unpaid Leave / Parental Leave / Leave Without Pay |
+| PoC | Proof of Concept |
+| DQ | Data Quality |
+| 3NF | Third Normal Form (Inmon data modelling) |
+| SP | Stored Procedure |
+| HRIS | Human Resources Information System |
+| ASGI | Asynchronous Server Gateway Interface |
+| BDAXAI | Internal platform architecture pattern (lifespan, writelog, POWERHOUSE_* env vars) |
