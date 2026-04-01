@@ -214,7 +214,7 @@ FastAPI Swagger: https://<codespace-name>-8090.app.github.dev/docs
 cd poc
 uvicorn main:app --host 0.0.0.0 --port 8090  --reload --proxy-headers --root-path / --forwarded-allow-ips='*' &
 sleep 3
-streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true &
+streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true --server.enableCORS false --server.enableXsrfProtection false &
 ```
 
 **Quick smoke test:**
