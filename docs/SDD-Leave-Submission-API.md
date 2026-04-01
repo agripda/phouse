@@ -7,9 +7,9 @@
 
 ```
 Document Title:  Leave Submission API — Day-Level Persistence
-Version:         2.1
-Date:            2026-03-29
-Author(s):       Bomyung Kim
+Version:         2.3
+Date:            2026-04-01
+Author(s):       David Kim
 Reviewer(s):     —
 Approver(s):     —
 ```
@@ -24,6 +24,8 @@ Approver(s):     —
 | 1.6 | 2026-03-27 | David | Assessment compliance note + dual-mode SubmissionId |
 | 1.7 | 2026-03-29 | David | SQL Server SP layer, UNQ-001 hard reject, Appendix restructure |
 | 2.0 | 2026-03-29 | David | Full restructure to standard SDD template |
+| 2.2 | 2026-04-01 | David | SCD type classification at table level (§7.3); audit fields CreatedDatetime / UpdatedDatetime added to LeaveSubmission and LeaveDay; SCD Type 2 evolution path added to §15 |
+| 2.3 | 2026-04-01 | David | Bug fixes: `db_setup.py` — `DB_PATH` changed from `str` to `Path` (resolves HTTP 500 `is_relative_to` error in `database_sqlite.py`); `create_database` alias added (resolves `ImportError` in `main.py`) |
 
 
 ---
@@ -283,7 +285,7 @@ Workers submit leave requests covering multi-day periods. The current approach s
 
 The schema follows a normalised header–detail (Inmon 3NF) structure. `WorkerId` is deliberately denormalised on `LeaveDay` (Kimball pattern) to enable fast calendar queries without joining to the header table.
 
-**Entity: dbo.LeaveSubmission** — one row per submission
+**Entity: dbo.LeaveSubmission** — one row per submission · **SCD Type 1**
 
 | Column | Type | Notes |
 |---|---|---|
@@ -294,8 +296,10 @@ The schema follows a normalised header–detail (Inmon 3NF) structure. `WorkerId
 | TotalDays | `INT` | Validated working-day count |
 | Status | `VARCHAR(20)` | Submitted / Draft / Pending |
 | SubmittedDate | `DATE` | Date only, no time |
+| CreatedDatetime | `DATETIME` | Set once on INSERT — `GETDATE()` / `datetime.now()` |
+| UpdatedDatetime | `DATETIME` | Updated on every UPDATE — `GETDATE()` / `datetime.now()`; initially equal to `CreatedDatetime` |
 
-**Entity: dbo.LeaveDay** — one row per Mon–Fri working day
+**Entity: dbo.LeaveDay** — one row per Mon–Fri working day · **Fact Table**
 
 | Column | Type | Notes |
 |---|---|---|
@@ -307,10 +311,11 @@ The schema follows a normalised header–detail (Inmon 3NF) structure. `WorkerId
 | LeaveCategory | `VARCHAR(20)` | Paid / Unpaid |
 | UnitOfMeasure | `VARCHAR(10)` | Days / Hours |
 | Quantity | `DECIMAL(5,2)` | Always 1.00 per day row |
+| CreatedDatetime | `DATETIME` | Set once on INSERT — append-only fact; no UpdatedDatetime |
 
-**Indexes & constraints:** `UQ (SubmissionId, LeaveDate, LeaveTypeCode)` · `IX_LeaveDay_SubmissionId` · `IX_LeaveDay_WorkerId_Date`
+**Indexes & constraints:** `IX_LeaveSubmission_WorkerId` · `UQ (SubmissionId, LeaveDate, LeaveTypeCode)` · `IX_LeaveDay_SubmissionId` · `IX_LeaveDay_WorkerId_Date`
 
-**Entity: dbo.DQResult** ⭐ — one row per DQ warning per submission
+**Entity: dbo.DQResult** ⭐ — one row per DQ warning per submission · **Type 0 / Append-Only Event Log**
 
 | Column | Type | Notes |
 |---|---|---|
@@ -335,6 +340,8 @@ erDiagram
         INT TotalDays
         VARCHAR20 Status
         DATE SubmittedDate
+        DATETIME CreatedDatetime
+        DATETIME UpdatedDatetime
     }
     LeaveDay {
         INT LeaveDayId PK
@@ -345,11 +352,12 @@ erDiagram
         VARCHAR20 LeaveCategory
         VARCHAR10 UnitOfMeasure
         DECIMAL52 Quantity
+        DATETIME CreatedDatetime
     }
     DQResult {
         INT DQResultId PK
         VARCHAR50 SubmissionId FK
-        TEXT CheckedAt
+        DATETIME CheckedAt
         VARCHAR20 Domain
         VARCHAR10 Severity
         VARCHAR10 Code
@@ -583,6 +591,7 @@ Developer machine
 | DQ — expand Critical rules | Only UNQ-001 is Critical | Promote CON-002 (quantity mismatch) and ACC-003 (invalid type) |
 | Approval workflow | Status field only — no workflow engine | Event-driven approval via message queue |
 | Surrogate PK | `SubmissionId VARCHAR(50)` as PK — slower FK joins | Add `Id INT IDENTITY` surrogate PK for high-volume join scenarios |
+| SCD Type 2 — `LeaveSubmission` | Current schema (Type 1) overwrites `Status` in-place — no change history | Evolve to SCD Type 2: add `SubmissionSK INT IDENTITY` (surrogate PK), `EffectiveStartDate DATE`, `EffectiveEndDate DATE` (NULL = current), `IsCurrent BIT`; retain `SubmissionId` as Business Key. Update `LeaveDay.FK` to `SubmissionSK` for version-accurate point-in-time queries. Enforce period integrity and single `IsCurrent = 1` per `SubmissionId` in `persist_submission()` within a single transaction. Enables: approval duration analysis, submission state at any historical point. |
 | Worker dimension | `WorkerId` bare string, no FK | Add `dbo.Worker` reference table + referential integrity |
 | Analytical reporting / Power BI | OLTP schema only | Add a Gold-layer view (`vw_LeaveDay_Gold`) as a Star Schema projection over `dbo.LeaveDay` — directly connectable to Power BI as a semantic layer without schema changes |
 | HRIS integration | `WorkerId` accepted as-is | Live validation against HRIS worker API |
@@ -782,7 +791,7 @@ streamlit run app.py
 
 | File | Production (SQL Server) | Purpose | PoC (SQLite) | Purpose |
 |---|---|---|---|---|
-| Schema / DDL | `schema.sql` | SQL Server DDL + `usp_PersistLeaveSubmission` SP | `poc/db_setup.py` | SQLite DDL, self-healing |
+| Schema / DDL | `schema.sql` | SQL Server DDL + `usp_PersistLeaveSubmission` SP | `poc/db_setup.py` | SQLite DDL, self-healing; `DB_PATH` is a `Path` object (not `str`); exports `create_database` alias for `main.py` compatibility |
 | Models | `models.py` | Pydantic v2 schemas | `poc/models.py` | Shared with production |
 | Business logic | `business_logic.py` | Day decomposition, validation | `poc/business_logic.py` | Shared with production |
 | DB layer | `database.py` | `pyodbc` + SP call | `poc/database_sqlite.py` | SQLite with verbose logging |

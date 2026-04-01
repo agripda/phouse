@@ -1,221 +1,186 @@
--- ============================================================
--- schema.sql — SQL Server DDL for Leave Submission API
--- Mirrors SQLite PoC schema (db_setup.py DDL)
--- Run once against target database before first API startup.
--- ============================================================
+-- =============================================================================
+-- Leave Submission API — SQL Server Production Schema
+-- Version : 2.2
+-- Date    : 2026-04-01
+-- Author  : David Kim
+-- Changes : Added CreatedDatetime / UpdatedDatetime audit fields to
+--           LeaveSubmission and LeaveDay; SCD type labels in comments.
+-- =============================================================================
 
-USE [LeaveDB];   -- change to your target database
+USE LeaveDB;
 GO
 
--- ──────────────────────────────────────────────────────────
--- 1. LeaveSubmission  (header — one row per submission)
--- ──────────────────────────────────────────────────────────
-IF OBJECT_ID('dbo.LeaveSubmission', 'U') IS NULL
-BEGIN
-    CREATE TABLE dbo.LeaveSubmission (
-        SubmissionId    VARCHAR(50)  NOT NULL,  -- caller-supplied or LS-YYYY-NNNNNN
-        WorkerId        VARCHAR(50)  NOT NULL,  -- HRIS external reference
-        StartDatetime   DATETIME     NOT NULL,  -- ISO-8601 start incl. time
-        EndDatetime     DATETIME     NOT NULL,  -- 23:59:59.99 end-of-day
-        TotalDays       INT          NOT NULL,  -- validated working-day count
-        Status          VARCHAR(20)  NOT NULL,  -- Submitted / Draft / Pending
-        SubmittedDate   DATE         NOT NULL,  -- date only
-
-        CONSTRAINT PK_LeaveSubmission
-            PRIMARY KEY CLUSTERED (SubmissionId)
-    );
-
-    CREATE INDEX IX_LeaveSubmission_WorkerId
-        ON dbo.LeaveSubmission (WorkerId);
-
-    PRINT '[schema] ✅ LeaveSubmission created.';
-END
-ELSE
-    PRINT '[schema] LeaveSubmission already exists — skipped.';
+-- -----------------------------------------------------------------------------
+-- 1. LeaveSubmission  (SCD Type 1)
+--    One row per submission.  Status updated in-place.
+--    Audit: CreatedDatetime set on INSERT; UpdatedDatetime refreshed on UPDATE.
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('dbo.LeaveSubmission', 'U') IS NOT NULL
+    DROP TABLE dbo.LeaveSubmission;
 GO
 
--- ──────────────────────────────────────────────────────────
--- 2. LeaveDay  (detail — one row per Mon-Fri working day)
--- Columns match assessment spec exactly.
--- WorkerId denormalised (Kimball) for fast calendar queries.
--- ──────────────────────────────────────────────────────────
-IF OBJECT_ID('dbo.LeaveDay', 'U') IS NULL
-BEGIN
-    CREATE TABLE dbo.LeaveDay (
-        LeaveDayId      INT IDENTITY(1,1) NOT NULL,
-        SubmissionId    VARCHAR(50)       NOT NULL,  -- FK → LeaveSubmission
-        WorkerId        VARCHAR(50)       NOT NULL,  -- denormalised (Kimball)
-        LeaveDate       DATE              NOT NULL,  -- YYYY-MM-DD
-        LeaveTypeCode   VARCHAR(10)       NOT NULL,  -- AL / SL / CL …
-        LeaveCategory   VARCHAR(20)       NOT NULL,  -- Paid / Unpaid
-        UnitOfMeasure   VARCHAR(10)       NOT NULL,  -- Days / Hours
-        Quantity        DECIMAL(5,2)      NOT NULL,  -- always 1.00 per row
+CREATE TABLE dbo.LeaveSubmission (
+    SubmissionId      VARCHAR(50)   NOT NULL,
+    WorkerId          VARCHAR(50)   NOT NULL,
+    StartDatetime     DATETIME      NOT NULL,
+    EndDatetime       DATETIME      NOT NULL,
+    TotalDays         INT           NOT NULL,
+    Status            VARCHAR(20)   NOT NULL,
+    SubmittedDate     DATE          NOT NULL,
 
-        CONSTRAINT PK_LeaveDay
-            PRIMARY KEY CLUSTERED (LeaveDayId),
+    -- Audit fields
+    CreatedDatetime   DATETIME      NOT NULL  CONSTRAINT DF_LeaveSubmission_Created  DEFAULT GETDATE(),
+    UpdatedDatetime   DATETIME      NOT NULL  CONSTRAINT DF_LeaveSubmission_Updated  DEFAULT GETDATE(),
 
-        CONSTRAINT FK_LeaveDay_Submission
-            FOREIGN KEY (SubmissionId)
-            REFERENCES dbo.LeaveSubmission (SubmissionId),
-
-        CONSTRAINT UQ_Submission_Date_Type
-            UNIQUE (SubmissionId, LeaveDate, LeaveTypeCode)
-    );
-
-    CREATE INDEX IX_LeaveDay_SubmissionId
-        ON dbo.LeaveDay (SubmissionId);
-
-    CREATE INDEX IX_LeaveDay_WorkerId_Date
-        ON dbo.LeaveDay (WorkerId, LeaveDate);
-
-    PRINT '[schema] ✅ LeaveDay created.';
-END
-ELSE
-    PRINT '[schema] LeaveDay already exists — skipped.';
+    CONSTRAINT PK_LeaveSubmission PRIMARY KEY (SubmissionId)
+);
 GO
 
--- ──────────────────────────────────────────────────────────
--- 3. DQResult  (one row per DQ issue per submission)
--- ⭐ Bonus — beyond assessment scope
--- ──────────────────────────────────────────────────────────
-IF OBJECT_ID('dbo.DQResult', 'U') IS NULL
-BEGIN
-    CREATE TABLE dbo.DQResult (
-        DQResultId      INT IDENTITY(1,1) NOT NULL,
-        SubmissionId    VARCHAR(50)       NOT NULL,
-        CheckedAt       DATETIME          NOT NULL DEFAULT GETDATE(),
-        Domain          VARCHAR(20)       NOT NULL,  -- Accuracy / Completeness …
-        Severity        VARCHAR(10)       NOT NULL,  -- Critical / Warning
-        Code            VARCHAR(10)       NOT NULL,  -- e.g. ACC-001
-        Field           VARCHAR(100)      NULL,      -- affected payload field path
-        Message         NVARCHAR(MAX)     NOT NULL,
-
-        CONSTRAINT PK_DQResult
-            PRIMARY KEY CLUSTERED (DQResultId),
-
-        CONSTRAINT FK_DQResult_Submission
-            FOREIGN KEY (SubmissionId)
-            REFERENCES dbo.LeaveSubmission (SubmissionId)
-    );
-
-    CREATE INDEX IX_DQResult_SubmissionId
-        ON dbo.DQResult (SubmissionId);
-
-    CREATE INDEX IX_DQResult_Domain_Severity
-        ON dbo.DQResult (Domain, Severity);
-
-    PRINT '[schema] ✅ DQResult created.';
-END
-ELSE
-    PRINT '[schema] DQResult already exists — skipped.';
+-- -----------------------------------------------------------------------------
+-- 2. LeaveDay  (Fact Table — append-only)
+--    One row per Mon–Fri working day.  Rows are never updated after INSERT.
+--    Audit: CreatedDatetime only (no UpdatedDatetime).
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('dbo.LeaveDay', 'U') IS NOT NULL
+    DROP TABLE dbo.LeaveDay;
 GO
 
--- ──────────────────────────────────────────────────────────
+CREATE TABLE dbo.LeaveDay (
+    LeaveDayId        INT           NOT NULL  IDENTITY(1,1),
+    SubmissionId      VARCHAR(50)   NOT NULL,
+    WorkerId          VARCHAR(50)   NOT NULL,
+    LeaveDate         DATE          NOT NULL,
+    LeaveTypeCode     VARCHAR(10)   NOT NULL,
+    LeaveCategory     VARCHAR(20)   NOT NULL,
+    UnitOfMeasure     VARCHAR(10)   NOT NULL,
+    Quantity          DECIMAL(5,2)  NOT NULL,
+
+    -- Audit field (append-only — no UpdatedDatetime)
+    CreatedDatetime   DATETIME      NOT NULL  CONSTRAINT DF_LeaveDay_Created  DEFAULT GETDATE(),
+
+    CONSTRAINT PK_LeaveDay        PRIMARY KEY (LeaveDayId),
+    CONSTRAINT FK_LeaveDay_Sub    FOREIGN KEY (SubmissionId)
+                                  REFERENCES dbo.LeaveSubmission (SubmissionId),
+    CONSTRAINT UQ_LeaveDay        UNIQUE (SubmissionId, LeaveDate, LeaveTypeCode)
+);
+GO
+
+CREATE INDEX IX_LeaveSubmission_WorkerId  ON dbo.LeaveSubmission (WorkerId);
+CREATE INDEX IX_LeaveDay_SubmissionId    ON dbo.LeaveDay (SubmissionId);
+CREATE INDEX IX_LeaveDay_WorkerId_Date   ON dbo.LeaveDay (WorkerId, LeaveDate);
+GO
+
+-- -----------------------------------------------------------------------------
+-- 3. DQResult  (Type 0 / Append-Only Event Log)
+--    One row per DQ warning per submission.  Rows are never updated.
+--    CheckedAt serves as the creation timestamp — no separate audit fields.
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('dbo.DQResult', 'U') IS NOT NULL
+    DROP TABLE dbo.DQResult;
+GO
+
+CREATE TABLE dbo.DQResult (
+    DQResultId        INT           NOT NULL  IDENTITY(1,1),
+    SubmissionId      VARCHAR(50)   NOT NULL,
+    CheckedAt         DATETIME      NOT NULL  CONSTRAINT DF_DQResult_CheckedAt  DEFAULT GETDATE(),
+    Domain            VARCHAR(20)   NOT NULL,
+    Severity          VARCHAR(10)   NOT NULL,
+    Code              VARCHAR(10)   NOT NULL,
+    Field             VARCHAR(100)  NULL,
+    Message           TEXT          NULL,
+
+    CONSTRAINT PK_DQResult        PRIMARY KEY (DQResultId),
+    CONSTRAINT FK_DQResult_Sub    FOREIGN KEY (SubmissionId)
+                                  REFERENCES dbo.LeaveSubmission (SubmissionId)
+);
+GO
+
+-- =============================================================================
 -- 4. usp_PersistLeaveSubmission
---    Replaces: database_sqlite.persist_submission()
---              + database_sqlite.persist_dq_results()
---
---    Accepts day rows and DQ issues as JSON strings so the
---    Python caller makes a single SP call per submission
---    (no N+1 inserts, no separate DQ round-trip).
--- ──────────────────────────────────────────────────────────
-CREATE OR ALTER PROCEDURE dbo.usp_PersistLeaveSubmission
-    -- Submission header fields (mirrors LeaveSubmissionPayload)
-    @SubmissionId    VARCHAR(50),
-    @WorkerId        VARCHAR(50),
-    @StartDatetime   DATETIME,
-    @EndDatetime     DATETIME,
-    @TotalDays       INT,
-    @Status          VARCHAR(20),
-    @SubmittedDate   DATE,
+--    Atomic INSERT of LeaveSubmission header + LeaveDay rows + DQResult rows.
+--    Duplicate guard uses UPDLOCK/HOLDLOCK to prevent concurrent race.
+--    Audit fields are set via column DEFAULT — no explicit value required.
+-- =============================================================================
+IF OBJECT_ID('dbo.usp_PersistLeaveSubmission', 'P') IS NOT NULL
+    DROP PROCEDURE dbo.usp_PersistLeaveSubmission;
+GO
 
-    -- JSON arrays serialised by the Python caller
-    -- LeaveDay rows: [{"leaveDate":"…","leaveTypeCode":"AL","leaveCategory":"Paid","unitOfMeasure":"Days","quantity":1.0}, …]
-    @LeaveDaysJson   NVARCHAR(MAX),
-
-    -- DQ issues: [{"domain":"…","severity":"Warning","code":"ACC-001","field":"…","message":"…"}, …]
-    -- Pass NULL or '[]' if no issues.
-    @DQIssuesJson    NVARCHAR(MAX) = NULL,
-
-    -- OUTPUT: echoes back the SubmissionId used (caller confirmation)
-    @FinalId         VARCHAR(50)   OUTPUT
+CREATE PROCEDURE dbo.usp_PersistLeaveSubmission
+    @SubmissionId     VARCHAR(50),
+    @WorkerId         VARCHAR(50),
+    @StartDatetime    DATETIME,
+    @EndDatetime      DATETIME,
+    @TotalDays        INT,
+    @Status           VARCHAR(20),
+    @SubmittedDate    DATE,
+    @LeaveDaysJson    NVARCHAR(MAX),   -- JSON array of LeaveDay rows
+    @DQIssuesJson     NVARCHAR(MAX)    -- JSON array of DQResult rows (may be '[]')
 AS
 BEGIN
     SET NOCOUNT ON;
-    SET XACT_ABORT ON;   -- any error auto-rolls back the whole transaction
+    SET XACT_ABORT ON;  -- auto-rollback on any error
 
     BEGIN TRANSACTION;
 
-    -- ── 1. Duplicate guard ──────────────────────────────────────────────
-    IF EXISTS (
-        SELECT 1
-        FROM   dbo.LeaveSubmission WITH (UPDLOCK, HOLDLOCK)
-        WHERE  SubmissionId = @SubmissionId
-    )
-    BEGIN
-        ROLLBACK;
-        THROW 50409, 'SubmissionId already exists.', 1;
-        -- Python caller catches error number 50409 → HTTP 409
-    END;
+        -- Duplicate guard
+        IF EXISTS (
+            SELECT 1
+            FROM dbo.LeaveSubmission WITH (UPDLOCK, HOLDLOCK)
+            WHERE SubmissionId = @SubmissionId
+        )
+        BEGIN
+            THROW 50409, 'Duplicate SubmissionId', 1;
+        END
 
-    -- ── 2. Insert submission header ─────────────────────────────────────
-    INSERT INTO dbo.LeaveSubmission
-        (SubmissionId, WorkerId, StartDatetime, EndDatetime,
-         TotalDays,    Status,   SubmittedDate)
-    VALUES
-        (@SubmissionId, @WorkerId, @StartDatetime, @EndDatetime,
-         @TotalDays,    @Status,   @SubmittedDate);
+        -- Insert header (CreatedDatetime + UpdatedDatetime set by DEFAULT)
+        INSERT INTO dbo.LeaveSubmission
+            (SubmissionId, WorkerId, StartDatetime, EndDatetime,
+             TotalDays, Status, SubmittedDate)
+        VALUES
+            (@SubmissionId, @WorkerId, @StartDatetime, @EndDatetime,
+             @TotalDays, @Status, @SubmittedDate);
 
-    -- ── 3. Bulk-insert LeaveDay rows from JSON ──────────────────────────
-    --    OPENJSON + set-based INSERT replaces Python executemany loop.
-    --    For a 15-day submission: 1 SP call vs 15 individual round-trips.
-    INSERT INTO dbo.LeaveDay
-        (SubmissionId, WorkerId, LeaveDate,
-         LeaveTypeCode, LeaveCategory, UnitOfMeasure, Quantity)
-    SELECT
-        @SubmissionId,
-        @WorkerId,
-        CAST(j.LeaveDate    AS DATE),
-        j.LeaveTypeCode,
-        j.LeaveCategory,
-        j.UnitOfMeasure,
-        CAST(j.Quantity     AS DECIMAL(5,2))
-    FROM OPENJSON(@LeaveDaysJson)
-    WITH (
-        LeaveDate       VARCHAR(10)  '$.leaveDate',
-        LeaveTypeCode   VARCHAR(10)  '$.leaveTypeCode',
-        LeaveCategory   VARCHAR(20)  '$.leaveCategory',
-        UnitOfMeasure   VARCHAR(10)  '$.unitOfMeasure',
-        Quantity        FLOAT        '$.quantity'
-    ) AS j;
-
-    -- ── 4. Insert DQ issues (warning-severity only; Critical never reaches here)
-    IF @DQIssuesJson IS NOT NULL AND LEN(@DQIssuesJson) > 2  -- '[]' = 2 chars
-    BEGIN
-        INSERT INTO dbo.DQResult
-            (SubmissionId, CheckedAt, Domain, Severity, Code, Field, Message)
+        -- Bulk insert day rows (CreatedDatetime set by DEFAULT)
+        INSERT INTO dbo.LeaveDay
+            (SubmissionId, WorkerId, LeaveDate, LeaveTypeCode,
+             LeaveCategory, UnitOfMeasure, Quantity)
         SELECT
             @SubmissionId,
-            GETDATE(),
-            d.Domain,
-            d.Severity,
-            d.Code,
-            d.Field,
-            d.Message
-        FROM OPENJSON(@DQIssuesJson)
-        WITH (
-            Domain    VARCHAR(20)    '$.domain',
-            Severity  VARCHAR(10)    '$.severity',
-            Code      VARCHAR(10)    '$.code',
-            Field     VARCHAR(100)   '$.field',
-            Message   NVARCHAR(MAX)  '$.message'
-        ) AS d;
-    END;
+            @WorkerId,
+            CAST(j.LeaveDate      AS DATE),
+            j.LeaveTypeCode,
+            j.LeaveCategory,
+            j.UnitOfMeasure,
+            CAST(j.Quantity       AS DECIMAL(5,2))
+        FROM OPENJSON(@LeaveDaysJson) WITH (
+            LeaveDate       NVARCHAR(20)  '$.leave_date',
+            LeaveTypeCode   NVARCHAR(10)  '$.leave_type_code',
+            LeaveCategory   NVARCHAR(20)  '$.leave_category',
+            UnitOfMeasure   NVARCHAR(10)  '$.unit_of_measure',
+            Quantity        NVARCHAR(10)  '$.quantity'
+        ) AS j;
 
-    COMMIT;
-    SET @FinalId = @SubmissionId;
+        -- Insert DQ issues if any (CheckedAt set by DEFAULT)
+        IF @DQIssuesJson <> '[]'
+        BEGIN
+            INSERT INTO dbo.DQResult
+                (SubmissionId, Domain, Severity, Code, Field, Message)
+            SELECT
+                @SubmissionId,
+                j.Domain,
+                j.Severity,
+                j.Code,
+                j.Field,
+                j.Message
+            FROM OPENJSON(@DQIssuesJson) WITH (
+                Domain    NVARCHAR(20)   '$.domain',
+                Severity  NVARCHAR(10)   '$.severity',
+                Code      NVARCHAR(10)   '$.code',
+                Field     NVARCHAR(100)  '$.field',
+                Message   NVARCHAR(MAX)  '$.message'
+            ) AS j;
+        END
+
+    COMMIT TRANSACTION;
 END;
-GO
-
-PRINT '[schema] ✅ usp_PersistLeaveSubmission created / updated.';
 GO
