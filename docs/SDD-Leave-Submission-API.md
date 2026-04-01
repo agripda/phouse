@@ -32,17 +32,17 @@ Reviewer(s):     —
 Approver(s):     —
 ```
 
-| Version | Date | Author | Description |
+| Version | Date | Description |
 |---|---|---|---|
-| 1.0 | 2026-03-27 | David | Initial draft — SQL Server production schema |
-| 1.2 | 2026-03-27 | David | SQLite PoC + Streamlit UI added |
-| 1.3 | 2026-03-27 | David | Atomic SubmissionId + concurrency handling |
-| 1.4 | 2026-03-27 | David | API specification section |
-| 1.5 | 2026-03-27 | David | DQ engine + DQResult table |
-| 1.6 | 2026-03-27 | David | Assessment compliance note + dual-mode SubmissionId |
-| 1.7 | 2026-03-29 | David | SQL Server SP layer, UNQ-001 hard reject, Appendix restructure |
-| 2.0 | 2026-03-29 | David | Full restructure to standard SDD template |
-| 2.2 | 2026-04-01 | David | SCD type classification at table level (§7.3); audit fields CreatedDatetime / UpdatedDatetime added to LeaveSubmission and LeaveDay; SCD Type 2 evolution path added to §15 |
+| 1.0 | 2026-03-27 | Initial draft — SQL Server production schema |
+| 1.2 | 2026-03-27 | SQLite PoC + Streamlit UI added |
+| 1.3 | 2026-03-27 | Atomic SubmissionId + concurrency handling |
+| 1.4 | 2026-03-27 | API specification section |
+| 1.5 | 2026-03-27 | DQ engine + DQResult table |
+| 1.6 | 2026-03-27 | Assessment compliance note + dual-mode SubmissionId |
+| 1.7 | 2026-03-29 | SQL Server SP layer, UNQ-001 hard reject, Appendix restructure |
+| 2.0 | 2026-03-29 | Full restructure to standard SDD template |
+| 2.2 | 2026-04-01 | SCD type classification at table level (§7.3); audit fields CreatedDatetime / UpdatedDatetime added to LeaveSubmission and LeaveDay; SCD Type 2 evolution path added to §15 |
 
 
 ---
