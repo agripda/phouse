@@ -33,7 +33,7 @@ Approver(s):     —
 ```
 
 | Version | Date | Description |
-|---|---|---|---|
+|---|---|---|
 | 1.0 | 2026-03-27 | Initial draft — SQL Server production schema |
 | 1.2 | 2026-03-27 | SQLite PoC + Streamlit UI added |
 | 1.3 | 2026-03-27 | Atomic SubmissionId + concurrency handling |
