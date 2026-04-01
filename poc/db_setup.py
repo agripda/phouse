@@ -1,121 +1,114 @@
-# -*- coding: utf-8 -*-
 """
-db_setup.py — Create and seed the SQLite database.
+db_setup.py — SQLite PoC schema initialisation
+Version : 2.2
+Date    : 2026-04-01
+Author  : David Kim
+Changes : Added CreatedDatetime / UpdatedDatetime audit fields to
+          LeaveSubmission and LeaveDay; SCD type labels in comments.
 
-Creates:  data/leave.db
-Tables:   LeaveSubmission (header), LeaveDay (detail)
-
-Schema design decisions
------------------------
-LeaveSubmission
-  - SubmissionId (TEXT PK) — spec-defined PK, server-generated LS-YYYY-NNNNNN
-  - WorkerId kept as plain TEXT — Worker master data owned by external HRIS
-
-LeaveDay
-  - Matches spec columns exactly
-  - SubmissionId FK → LeaveSubmission.SubmissionId
-  - WorkerId denormalised intentionally (Kimball pattern) for fast calendar queries
-  - UNIQUE on (SubmissionId, LeaveDate, LeaveTypeCode) — within-submission dedup
+Self-healing: safe to run multiple times — uses CREATE TABLE IF NOT EXISTS.
 """
 
 import sqlite3
+import os
 from pathlib import Path
 
-# ── Path ──────────────────────────────────────────────────────────────────────
-DB_DIR  = Path(__file__).parent / "data"
-DB_PATH = DB_DIR / "leave.db"
+
+# ---------------------------------------------------------------------------
+# Resolve DB path relative to this file — independent of working directory
+# ---------------------------------------------------------------------------
+# _DIR = os.path.dirname(os.path.abspath(__file__))
+# DB_PATH = os.path.join(_DIR, "data", "leave.db")
+
+_DIR = Path(os.path.abspath(__file__)).parent
+DB_PATH = _DIR / "data" / "leave.db"
 
 DDL = """
--- -----------------------------------------------------------------------
--- LeaveSubmission  (header — one row per submission)
--- SubmissionId is the spec-defined PK: server-generated LS-YYYY-NNNNNN
--- -----------------------------------------------------------------------
+-- ===========================================================================
+-- 1. LeaveSubmission  (SCD Type 1)
+--    One row per submission.  Status updated in-place.
+--    Audit: CreatedDatetime set on INSERT; UpdatedDatetime refreshed on UPDATE.
+-- ===========================================================================
 CREATE TABLE IF NOT EXISTS LeaveSubmission (
-    SubmissionId    TEXT    NOT NULL,   -- server-generated LS-YYYY-NNNNNN
-    WorkerId        TEXT    NOT NULL,   -- HRIS external reference
-    StartDatetime   TEXT    NOT NULL,   -- ISO-8601
-    EndDatetime     TEXT    NOT NULL,   -- ISO-8601
-    TotalDays       INTEGER NOT NULL,
-    Status          TEXT    NOT NULL,
-    SubmittedDate   TEXT    NOT NULL,   -- YYYY-MM-DD
+    SubmissionId      TEXT        NOT NULL,
+    WorkerId          TEXT        NOT NULL,
+    StartDatetime     TEXT        NOT NULL,
+    EndDatetime       TEXT        NOT NULL,
+    TotalDays         INTEGER     NOT NULL,
+    Status            TEXT        NOT NULL,
+    SubmittedDate     TEXT        NOT NULL,
 
-    CONSTRAINT PK_LeaveSubmission
-        PRIMARY KEY (SubmissionId)
+    -- Audit fields
+    CreatedDatetime   TEXT        NOT NULL  DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')),
+    UpdatedDatetime   TEXT        NOT NULL  DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')),
+
+    PRIMARY KEY (SubmissionId)
 );
 
--- -----------------------------------------------------------------------
--- LeaveDay  (detail — one row per Mon-Fri working day)
--- Columns match spec exactly; WorkerId denormalised for calendar queries
--- -----------------------------------------------------------------------
+-- ===========================================================================
+-- 2. LeaveDay  (Fact Table — append-only)
+--    One row per Mon–Fri working day.  Rows are never updated after INSERT.
+--    Audit: CreatedDatetime only (no UpdatedDatetime).
+-- ===========================================================================
 CREATE TABLE IF NOT EXISTS LeaveDay (
-    LeaveDayId      INTEGER NOT NULL,
-    SubmissionId    TEXT    NOT NULL,   -- FK -> LeaveSubmission.SubmissionId
-    WorkerId        TEXT    NOT NULL,   -- denormalised (Kimball pattern)
-    LeaveDate       TEXT    NOT NULL,   -- YYYY-MM-DD
-    LeaveTypeCode   TEXT    NOT NULL,   -- AL / SL / CL ...
-    LeaveCategory   TEXT    NOT NULL,   -- Paid / Unpaid
-    UnitOfMeasure   TEXT    NOT NULL,   -- Days / Hours
-    Quantity        REAL    NOT NULL,   -- always 1.00 per day row
+    LeaveDayId        INTEGER     NOT NULL  PRIMARY KEY AUTOINCREMENT,
+    SubmissionId      TEXT        NOT NULL,
+    WorkerId          TEXT        NOT NULL,
+    LeaveDate         TEXT        NOT NULL,
+    LeaveTypeCode     TEXT        NOT NULL,
+    LeaveCategory     TEXT        NOT NULL,
+    UnitOfMeasure     TEXT        NOT NULL,
+    Quantity          REAL        NOT NULL,
 
-    CONSTRAINT PK_LeaveDay
-        PRIMARY KEY (LeaveDayId AUTOINCREMENT),
+    -- Audit field (append-only — no UpdatedDatetime)
+    CreatedDatetime   TEXT        NOT NULL  DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')),
 
-    CONSTRAINT FK_LeaveDay_Submission
-        FOREIGN KEY (SubmissionId)
-        REFERENCES LeaveSubmission (SubmissionId),
-
-    CONSTRAINT UQ_Submission_Date_Type
-        UNIQUE (SubmissionId, LeaveDate, LeaveTypeCode)
+    FOREIGN KEY (SubmissionId) REFERENCES LeaveSubmission (SubmissionId),
+    UNIQUE (SubmissionId, LeaveDate, LeaveTypeCode)
 );
 
--- -----------------------------------------------------------------------
--- DQResult  (one row per DQ issue per submission)
--- -----------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS IX_LeaveSubmission_WorkerId ON LeaveSubmission (WorkerId);
+CREATE INDEX IF NOT EXISTS IX_LeaveDay_SubmissionId    ON LeaveDay (SubmissionId);
+CREATE INDEX IF NOT EXISTS IX_LeaveDay_WorkerId_Date   ON LeaveDay (WorkerId, LeaveDate);
+
+-- ===========================================================================
+-- 3. DQResult  (Type 0 / Append-Only Event Log)
+--    One row per DQ warning per submission.  Rows are never updated.
+--    CheckedAt serves as the creation timestamp — no separate audit fields.
+-- ===========================================================================
 CREATE TABLE IF NOT EXISTS DQResult (
-    DQResultId      INTEGER NOT NULL,
-    SubmissionId    TEXT    NOT NULL,
-    CheckedAt       TEXT    NOT NULL,   -- ISO-8601 timestamp
-    Domain          TEXT    NOT NULL,   -- Accuracy / Completeness / etc.
-    Severity        TEXT    NOT NULL,   -- Critical / Warning
-    Code            TEXT    NOT NULL,   -- e.g. ACC-001
-    Field           TEXT,              -- affected field path
-    Message         TEXT    NOT NULL,
+    DQResultId        INTEGER     NOT NULL  PRIMARY KEY AUTOINCREMENT,
+    SubmissionId      TEXT        NOT NULL,
+    CheckedAt         TEXT        NOT NULL  DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')),
+    Domain            TEXT        NOT NULL,
+    Severity          TEXT        NOT NULL,
+    Code              TEXT        NOT NULL,
+    Field             TEXT,
+    Message           TEXT,
 
-    CONSTRAINT PK_DQResult
-        PRIMARY KEY (DQResultId AUTOINCREMENT),
-
-    CONSTRAINT FK_DQResult_Submission
-        FOREIGN KEY (SubmissionId)
-        REFERENCES LeaveSubmission (SubmissionId)
+    FOREIGN KEY (SubmissionId) REFERENCES LeaveSubmission (SubmissionId)
 );
-
-CREATE INDEX IF NOT EXISTS IX_DQResult_SubmissionId
-    ON DQResult (SubmissionId);
-
-CREATE INDEX IF NOT EXISTS IX_DQResult_Domain_Severity
-    ON DQResult (Domain, Severity);
-
-
-CREATE INDEX IF NOT EXISTS IX_LeaveSubmission_WorkerId
-    ON LeaveSubmission (WorkerId);
-
-CREATE INDEX IF NOT EXISTS IX_LeaveDay_SubmissionId
-    ON LeaveDay (SubmissionId);
-
-CREATE INDEX IF NOT EXISTS IX_LeaveDay_WorkerId_Date
-    ON LeaveDay (WorkerId, LeaveDate);
 """
 
 
-def create_database() -> None:
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.executescript(DDL)
-    conn.commit()
-    conn.close()
-    print(f"[db_setup] ✅ Database ready at: {DB_PATH}")
+def init_db(db_path: str = DB_PATH) -> None:
+    """
+    Initialise (or self-heal) the SQLite database.
+    Creates the data directory if it does not exist.
+    Safe to call on every application startup.
+    """
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(DDL)
+        conn.commit()
+        print(f"[db_setup] ✅ Database ready: {db_path}")
+    finally:
+        conn.close()
 
+
+# Alias for backward compatibility — main.py imports create_database
+create_database = init_db
 
 if __name__ == "__main__":
-    create_database()
+    init_db()
