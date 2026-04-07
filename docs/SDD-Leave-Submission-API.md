@@ -7,8 +7,8 @@
 
 ```
 Document Title:  Leave Submission API — Day-Level Persistence
-Version:         2.3
-Date:            2026-04-01
+Version:         2.4
+Date:            2026-04-07
 Author(s):       Bomyung Kim
 Reviewer(s):     —
 Approver(s):     —
@@ -25,8 +25,8 @@ Approver(s):     —
 
 ```
 Document Title:  Leave Submission API — Day-Level Persistence
-Version:         2.3
-Date:            2026-04-01
+Version:         2.4
+Date:            2026-04-07
 Author(s):       Bomyung Kim
 Reviewer(s):     —
 Approver(s):     —
@@ -313,8 +313,8 @@ The schema follows a normalised header–detail (Inmon 3NF) structure. `WorkerId
 | TotalDays | `INT` | Validated working-day count |
 | Status | `VARCHAR(20)` | Submitted / Draft / Pending |
 | SubmittedDate | `DATE` | Date only, no time |
-| CreatedDatetime | `DATETIME` | Set once on INSERT — `GETDATE()` / `datetime.now()` |
-| UpdatedDatetime | `DATETIME` | Updated on every UPDATE — `GETDATE()` / `datetime.now()`; initially equal to `CreatedDatetime` |
+| CreatedDatetime | `DATETIME` | Set once on INSERT. SQL Server: `GETDATE()` · SQLite PoC: `strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')` |
+| UpdatedDatetime | `DATETIME` | Refreshed on every UPDATE; initially equal to `CreatedDatetime`. SQL Server: `GETDATE()` · SQLite PoC: `strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')` |
 
 **Entity: dbo.LeaveDay** — one row per Mon–Fri working day · **Fact Table**
 
@@ -338,12 +338,12 @@ The schema follows a normalised header–detail (Inmon 3NF) structure. `WorkerId
 |---|---|---|
 | **DQResultId** `PK` | `INT IDENTITY` | Surrogate, auto-increment |
 | SubmissionId `FK` | `VARCHAR(50)` | → LeaveSubmission.SubmissionId |
-| CheckedAt | `DATETIME` | ISO-8601 timestamp |
+| CheckedAt | `DATETIME` | Creation timestamp — serves as the audit field for this table; no separate `CreatedDatetime`. SQL Server: `GETDATE()` · SQLite PoC: `strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')` |
 | Domain | `VARCHAR(20)` | Accuracy / Completeness / Consistency / Timeliness / Uniqueness |
 | Severity | `VARCHAR(10)` | Warning only — Critical issues never reach this table |
 | Code | `VARCHAR(10)` | e.g. ACC-001 |
-| Field | `VARCHAR(100)` | Affected payload field path |
-| Message | `TEXT` | Human-readable description |
+| Field | `VARCHAR(100)` | Affected payload field path · **NULLABLE** — omitted for structural rules that span multiple fields |
+| Message | `TEXT` | Human-readable description · **NULLABLE** |
 
 **Entity relationship**
 
@@ -843,6 +843,7 @@ streamlit run app.py
 | 2.0 | 2026-03-29 | Bomyung Kim | Full restructure to standard SDD template |
 | 2.2 | 2026-04-01 | Bomyung Kim | SCD type classification at table level (§7.3); audit fields CreatedDatetime / UpdatedDatetime added to LeaveSubmission and LeaveDay; SCD Type 2 evolution path added to §15 |
 | 2.3 | 2026-04-01 | Bomyung Kim | Bug fixes: `db_setup.py` — `DB_PATH` changed from `str` to `Path` (resolves HTTP 500 `is_relative_to` error in `database_sqlite.py`); `create_database` alias added (resolves `ImportError` in `main.py`) |
+| 2.4 | 2026-04-07 | Bomyung Kim | §7.3 SQLite DEFAULT expressions added for audit fields (CreatedDatetime / UpdatedDatetime / CheckedAt); DQResult.Field and Message documented as NULLABLE |
 
 
 ---
@@ -1113,8 +1114,8 @@ The schema follows a normalised header–detail (Inmon 3NF) structure. `WorkerId
 | TotalDays | `INT` | Validated working-day count |
 | Status | `VARCHAR(20)` | Submitted / Draft / Pending |
 | SubmittedDate | `DATE` | Date only, no time |
-| CreatedDatetime | `DATETIME` | Set once on INSERT — `GETDATE()` / `datetime.now()` |
-| UpdatedDatetime | `DATETIME` | Updated on every UPDATE — `GETDATE()` / `datetime.now()`; initially equal to `CreatedDatetime` |
+| CreatedDatetime | `DATETIME` | Set once on INSERT. SQL Server: `GETDATE()` · SQLite PoC: `strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')` |
+| UpdatedDatetime | `DATETIME` | Refreshed on every UPDATE; initially equal to `CreatedDatetime`. SQL Server: `GETDATE()` · SQLite PoC: `strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')` |
 
 **Entity: dbo.LeaveDay** — one row per Mon–Fri working day · **Fact Table**
 
@@ -1138,12 +1139,12 @@ The schema follows a normalised header–detail (Inmon 3NF) structure. `WorkerId
 |---|---|---|
 | **DQResultId** `PK` | `INT IDENTITY` | Surrogate, auto-increment |
 | SubmissionId `FK` | `VARCHAR(50)` | → LeaveSubmission.SubmissionId |
-| CheckedAt | `DATETIME` | ISO-8601 timestamp |
+| CheckedAt | `DATETIME` | Creation timestamp — serves as the audit field for this table; no separate `CreatedDatetime`. SQL Server: `GETDATE()` · SQLite PoC: `strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')` |
 | Domain | `VARCHAR(20)` | Accuracy / Completeness / Consistency / Timeliness / Uniqueness |
 | Severity | `VARCHAR(10)` | Warning only — Critical issues never reach this table |
 | Code | `VARCHAR(10)` | e.g. ACC-001 |
-| Field | `VARCHAR(100)` | Affected payload field path |
-| Message | `TEXT` | Human-readable description |
+| Field | `VARCHAR(100)` | Affected payload field path · **NULLABLE** — omitted for structural rules that span multiple fields |
+| Message | `TEXT` | Human-readable description · **NULLABLE** |
 
 **Entity relationship**
 
